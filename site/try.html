@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="only light" />
+    <title>Try Saylo: talk to a voice agent in your language</title>
+    <meta
+      name="description"
+      content="Talk to Saylo, follow live transcripts, and revisit recent conversations."
+    />
+    <meta name="theme-color" content="#f5f7fb" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Saylo" />
+    <meta property="og:title" content="Try Saylo" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta property="og:image" content="/share.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&family=Geist+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/try.css" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/saylo-wave-32.png" />
+    <link rel="icon" type="image/svg+xml" href="/saylo-wave.svg" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/saylo-wave-180.png" />
+  </head>
+  <body>
+    <svg width="0" height="0" style="position: absolute" aria-hidden="true">
+      <symbol id="gh" viewBox="0 0 16 16">
+        <path
+          d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38v-1.33c-2.23.48-2.7-1.07-2.7-1.07-.36-.92-.89-1.17-.89-1.17-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.72 1.23 1.87.87 2.33.67.07-.52.28-.87.5-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"
+        />
+      </symbol>
+    </svg>
+
+    <header class="nav" id="top">
+      <a class="brand" href="/" aria-label="Saylo home">Saylo</a>
+      <nav class="nav-links" aria-label="Sections">
+        <a href="/#product">Product</a>
+        <a href="/#use-cases">Use cases</a>
+        <a href="/#integrate">Integrate</a>
+        <a href="/#languages">Languages</a>
+        <a href="/voices.html">Voices</a>
+        <a href="/setup.html" rel="noopener">Docs</a>
+      </nav>
+      <div class="nav-right">
+        <a class="nav-gh" href="/about.html">About</a>
+        <a class="btn btn-line btn-sm nav-try" href="/try.html">Try Saylo</a>
+        <a class="btn btn-dark btn-sm" href="/#integrate">Get started</a>
+      </div>
+    </header>
+
+    <main>
+      <section class="try-hero wrap" aria-labelledby="try-title">
+        <p class="kicker">Try Saylo</p>
+        <h1 id="try-title">
+          A conversation worth <span class="grad">coming back to.</span>
+        </h1>
+        <p class="lede">
+          Speak or type, follow every turn, and keep a short recap for later.
+        </p>
+      </section>
+
+      <section class="wrap try-grid" aria-label="Demo and live call">
+        <aside class="try-sidebar" aria-labelledby="demo-title">
+          <div class="glass try-video">
+            <p class="kicker">Meet Saylo</p>
+            <h2 id="demo-title">Your voice. Your pace.</h2>
+            <div class="saylo-wave" aria-hidden="true">
+              <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            </div>
+            <p class="muted">
+              This browser demo uses scripted local replies. Speech support
+              depends on your browser. Connect your own runtime for an AI agent.
+            </p>
+          </div>
+          <section class="glass history" aria-labelledby="history-title">
+            <div class="panel-heading">
+              <h3 id="history-title">Recent conversations</h3>
+              <button class="text-button" id="clearHistory" type="button">
+                Clear all
+              </button>
+            </div>
+            <p class="hint" id="storageStatus" role="status">
+              Up to 20 conversations, stored in this browser. Avoid sensitive
+              information on shared devices.
+            </p>
+            <ul id="historyList"></ul>
+          </section>
+        </aside>
+
+        <div class="glass try-call" aria-labelledby="call-title">
+          <p class="kicker">Talk to Saylo</p>
+          <p class="hint">
+            <a href="/setup.html#browser-demo">Conversation guide</a> ·
+            <a href="/setup.html#runtime">Connect your own runtime</a>
+          </p>
+          <h2 id="call-title">Conversation</h2>
+          <div class="demo-settings">
+            <label class="field"
+              ><span class="lbl">Experience</span
+              ><select id="mode">
+                <option value="browser">Browser demo</option>
+                <option value="server">
+                  Self-hosted voice runtime
+                </option>
+              </select></label
+            >
+            <div id="browserSetup">
+              <label class="field"
+                ><span class="lbl">Language</span
+                ><select id="language">
+                  <option value="en-US">English</option>
+                  <option value="es-ES">Español</option>
+                  <option value="fr-FR">Français</option>
+                  <option value="hi-IN">हिन्दी</option>
+                  <option value="ja-JP">日本語</option>
+                  <option value="ta-IN">தமிழ்</option>
+                </select></label
+              >
+              <label class="speak-option"
+                ><input type="checkbox" id="speak" checked /> Read replies
+                aloud</label
+              >
+              <p class="hint" id="speechHint">
+                Type in any browser. Voice input requires a supported browser
+                and microphone permission. Browser speech recognition may send
+                audio to its vendor; transcripts are stored locally on this
+                device.
+              </p>
+            </div>
+          </div>
+
+          <div id="localSetup" hidden>
+            <p class="hint">
+              New to this setup?
+              <a href="/setup.html#runtime">Follow the runtime quickstart</a>
+              before entering a server address.
+            </p>
+            <p class="muted">
+              Connect to your Go voice runtime, configured with your application
+              endpoint and speech providers. See
+              <a href="/setup.html#runtime">setup and architecture</a>.
+            </p>
+            <label class="field"
+              ><span class="lbl"
+                >Your Saylo server
+                <em
+                  >(the server, port 8080 by default, not the call page on
+                  8400)</em
+                ></span
+              >
+              <input
+                id="server"
+                type="url"
+                inputmode="url"
+                spellcheck="false"
+                placeholder="http://localhost:8080"
+            /></label>
+            <label class="field" id="voiceField" hidden
+              ><span class="lbl"
+                >Voice
+                <em
+                  >(the voices your server is set up with; set
+                  <code>client_choice = true</code> under
+                  <code>[tts]</code>)</em
+                ></span
+              >
+              <select id="voice"></select
+            ></label>
+            <p class="hint">
+              Your browser may ask to allow this page to reach devices on your
+              network. Allow it: the call goes from your browser straight to
+              your Saylo, never through us.
+            </p>
+          </div>
+
+          <div class="call-row">
+            <button class="btn btn-dark" id="call" type="button">
+              Start conversation <span class="arr" aria-hidden="true">→</span>
+            </button>
+            <button class="btn btn-line" id="hang" type="button" disabled>
+              End conversation
+            </button>
+          </div>
+          <p class="status" id="status" role="status" aria-live="polite">
+            <span class="dot"></span><span id="statusText">Not connected</span>
+          </p>
+          <div class="meter" aria-hidden="true">
+            <span id="meterBar"></span>
+          </div>
+          <div class="panel-heading transcript-heading">
+            <h3>Live transcript</h3>
+            <span id="sessionMode" class="hint">Browser demo</span>
+          </div>
+          <p class="hint" id="runtimeHint" hidden>
+            Runtime replies show generated text; interruptions may stop the
+            audio before all of it is spoken.
+          </p>
+          <div
+            class="log"
+            id="log"
+            role="log"
+            aria-label="Conversation transcript"
+            aria-live="off"
+            tabindex="0"
+          >
+            <p class="hint">Start a conversation to see it here.</p>
+          </div>
+          <form id="messageForm" class="message-form">
+            <label class="field"
+              ><span class="lbl">Your message</span
+              ><input
+                id="message"
+                maxlength="2000"
+                autocomplete="off"
+                placeholder="Say hello, or ask about Saylo…"
+                disabled
+            /></label>
+            <div class="call-row">
+              <button class="btn btn-dark btn-sm" id="send" disabled>
+                Send</button
+              ><button
+                class="btn btn-line btn-sm"
+                type="button"
+                id="listen"
+                disabled
+              >
+                Use microphone
+              </button>
+            </div>
+          </form>
+          <section
+            id="recap"
+            class="conversation-recap"
+            hidden
+            aria-labelledby="recap-title"
+          >
+            <div class="panel-heading">
+              <h3 id="recap-title">Conversation recap</h3>
+              <button id="copySummary" class="text-button" type="button">
+                Copy recap
+              </button>
+            </div>
+            <p class="hint">
+              An extractive recap of selected turns, created on your device. No
+              AI model is used.
+            </p>
+            <p id="summaryText"></p>
+            <p id="copyStatus" class="hint" role="status"></p>
+          </section>
+          <audio id="remote" autoplay></audio>
+        </div>
+      </section>
+
+      <section class="wrap try-tips" aria-label="Things to try">
+        <article class="glass">
+          <h3>Follow along</h3>
+          <p>
+            Partial speech becomes a completed turn. Every exchange stays in the
+            transcript.
+          </p>
+        </article>
+        <article class="glass">
+          <h3>Come back later</h3>
+          <p>
+            End a conversation to see its recap. Reopen recent sessions from
+            this browser.
+          </p>
+        </article>
+        <article class="glass">
+          <h3>Keep control</h3>
+          <p>
+            Type when voice input is unavailable. Delete individual
+            conversations or clear your history.
+          </p>
+        </article>
+      </section>
+    </main>
+
+    <footer class="wrap footer">
+      <span class="brand brand-sm">Saylo</span>
+      <span>Built on <a href="https://github.com/streamcoreai/streamcore-server" rel="noopener">StreamCore</a> · Apache 2.0</span>
+      <span class="footer-links"
+        ><a href="/">Home</a><a href="/setup.html" rel="noopener">Docs</a></span
+      >
+    </footer>
+
+    <script src="/try-config.js"></script>
+    <script type="module" src="/try.js"></script>
+    <script src="/nav.js" defer></script>
+  </body>
+</html>

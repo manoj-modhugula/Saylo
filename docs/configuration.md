@@ -1,0 +1,351 @@
+**English** | [简体中文](./configuration.zh-CN.md)
+
+# Configuration reference
+
+Start from [`config.toml.example`](../config.toml.example):
+
+```toml
+[server]
+port = "8080"
+# public_ip = ""       # Public IP for ICE candidates (e.g. EC2 Elastic IP); enables built-in STUN/TURN
+# turn_secret = ""     # Shared secret for the built-in STUN/TURN server (required when public_ip is set)
+# jwt_secret = ""      # Enables JWT auth on /whip and the POST /token endpoint
+# api_key = ""         # Required to call POST /token when set
+# session_grace_ms = 30000  # Grace period before a session with no peers is reaped (allows ICE restart / redial)
+# max_sessions = 0     # Global cap on live sessions; past it POST /whip returns 503 + Retry-After. 0 = unlimited
+
+[debug]
+bind = ""                      # Empty disables pprof; use 127.0.0.1:6060 and an SSH tunnel in production
+allow_public = false            # Required for a non-loopback bind; only for network-isolated deployments
+block_profile_rate = 0          # 1 records every blocking event; 0 disables block profiling
+mutex_profile_fraction = 0      # 1 records every mutex contention event; 0 disables mutex profiling
+
+[plugins]
+directory = "./plugins"
+
+# Per-plugin settings, keyed by the name in the plugin's manifest.
+# [plugins.config.github]
+# enabled = true
+
+[display]
+enabled = false                         # Optional display.card projection; disabled by default
+plugin = "display-projector"
+
+[display.projector]
+timeout_ms = 3000                       # Bound for one post-response projection model call
+fast_path_max_chars = 80                # Short simple answers are projected without another model call
+
+# Developer agent: GitHub App + the Codex harness. Both disabled by default.
+[github]
+enabled = false
+app_id = ""                 # App ID or client ID; used as the JWT `iss`
+installation_id = ""        # From the installation URL, or GET /repos/{owner}/{repo}/installation
+private_key_path = ""       # PEM downloaded when the app was created
+repositories = []           # Allowlist, as owner/name
+# api_base_url = ""         # GitHub Enterprise Server API root
+
+# Codex authenticates with your ChatGPT subscription. There is no api_key here.
+[codex]
+enabled = false
+binary = "codex"
+model_provider = "openai"
+model = "gpt-5.6-terra"
+workspace_root = "/var/lib/streamcore/codex"
+turn_timeout_ms = 600000
+# network_access = false    # Open the task sandbox to the network
+
+[pipeline]
+barge_in = true
+greeting = ""
+greeting_outgoing = ""
+debug = false
+user_speech_quiet_ms = 600           # Quiet period after the caller stops before the agent speaks
+turn_merge_ms = 350                  # Debounce window for merging finals into one turn
+# rag_prefetch = false               # Start retrieval during the merge window instead of after it
+# readback_bargein_guard_enabled = false  # Ignore weak barge-ins while the agent reads values back
+# echo_guard = "auto"                # auto | always | off. Auto follows each client's aec hint
+# echo_guard_gain = 0.6              # Echo cannot exceed this fraction of what produced it
+# echo_guard_margin = 1.8            # How far inbound must clear the echo bound to count as the caller
+# echo_guard_window_ms = 400         # How long sent audio stays in the reference window
+
+# Speech-to-speech. When set, replaces [stt], [llm], and [tts] entirely.
+[realtime]
+provider = ""                        # "grok", or empty for the classic pipeline
+
+[stt]
+provider = "deepgram"                # aliyun | assemblyai | deepgram | openai | telnyx | vibevoice | volcengine
+
+[llm]
+provider = "openai"                  # openai | ollama | agent
+
+[tts]
+provider = "cartesia"                # cartesia | deepgram | elevenlabs | mimo | minimax | speechify | telnyx | vibevoice
+
+# [grok]                             # Used when realtime.provider = "grok"
+# api_key = ""
+# model = "grok-voice-latest"        # Pin a version in production, e.g. grok-voice-think-fast-2.0
+# voice = "eve"
+# reasoning_effort = "high"          # "none" trades nuance for latency
+# system_prompt = ""                 # Keep short; long GPT-era prompts hurt these models
+# silence_duration_ms = 500          # Silence before the caller's turn ends
+# vad_threshold = 0.85               # 0.1-0.9; higher demands louder audio to trigger a turn
+# transcription = true               # Client-facing transcript only; the model hears audio directly
+# web_search = false                 # xAI-hosted search, no local plugin needed
+
+[deepgram]
+api_key = ""
+model = "nova-3"
+tts_model = "aura-2-thalia-en"       # Aura voice when tts.provider = "deepgram"; aura-2-theia-en is Australian feminine
+# language = ""                      # BCP-47 tag (en-US, es-MX); non-en/es routes to the multilingual model
+endpointing = "300"                  # Silence (ms) before a transcript is finalised
+utterance_end_ms = "1000"            # Silence (ms) before UtteranceEnd; flushes a turn with no speech_final
+# keyterms = ["Tauranga", "BYD"]     # Nova-3 only: bias the decoder toward domain vocabulary
+
+# [assemblyai]                       # Alternative streaming STT provider
+# api_key = ""
+# model = "u3-rt-pro"                # or "u3-rt" for the cheaper baseline
+# language = ""                      # BCP-47; region is stripped (en-NZ -> en). Empty auto-detects
+# format_turns = true                # Auto-punctuate and capitalise the final turn
+# end_of_turn_silence_ms = 0         # Override how long the model waits before ending a turn
+# keyterms = []
+
+# [aliyun]                           # Alibaba Cloud Model Studio (DashScope) streaming ASR
+# api_key = ""
+# model = ""                         # Defaults to paraformer-realtime-v2; fun-asr-realtime is the alternative
+# language = ""                      # Hint for a multilingual model ("zh", "en"); empty auto-detects
+# vocabulary_id = ""                 # Hotword list from the console, for terms it keeps getting wrong
+# url = ""                           # Defaults to wss://dashscope.aliyuncs.com/api-ws/v1/inference
+
+# [volcengine]                       # Doubao streaming ASR
+# api_key = ""                       # Console API key, sent as X-Api-Key; app-id + access-token is rejected
+# resource_id = ""                   # Defaults to volc.seedasr.sauc.duration (hourly); .concurrent bills by concurrency
+# model = ""                         # Defaults to bigmodel
+# end_window_ms = 0                  # Silence that settles an utterance, defaults to 800. Same role as endpointing
+
+[openai]
+api_key = ""
+model = "gpt-4o-mini"
+stt_model = "whisper-1"             # whisper-1 | gpt-4o-transcribe | gpt-4o-mini-transcribe
+system_prompt = "You are a helpful AI voice assistant. Keep your responses concise and conversational."
+
+[ollama]
+base_url = "http://localhost:11434"
+model = "gpt-oss:20b"
+system_prompt = "You are a helpful AI voice assistant. Keep your responses concise and conversational."
+
+[agent]                              # Bring your own agent: used when llm.provider = "agent"
+url = ""                             # Your endpoint, e.g. http://localhost:9000/agent. Each turn is POSTed as JSON
+api_key = ""                         # Sent as Authorization: Bearer. Empty disables auth
+timeout_ms = 60000                   # Whole-turn budget, including streaming the reply
+
+[cartesia]
+api_key = ""
+voice_id = ""
+max_concurrency = 3                  # Generations in flight before requests queue locally instead of 429ing
+# ws_url = ""                        # Defaults to wss://api.cartesia.ai/tts/websocket
+
+[elevenlabs]
+api_key = ""
+voice_id = ""
+model = ""
+
+[speechify]
+api_key = ""
+voice_id = ""
+model = ""
+
+[telnyx]                             # Telnyx hosted speech, used when tts.provider = "telnyx" or stt.provider = "telnyx"; one key covers both roles
+api_key = ""
+voice = "Telnyx.Qwen3TTS.d9348e0d-988a-42cc-a64e-18093fe45c03"        # Any catalog voice from GET /v2/text-to-speech/voices; availability varies by account
+voice_speed = 1.0                    # Playback-rate multiplier, clamped to 0.8-1.2
+transcription_engine = "Deepgram"    # STT engine, verified values: "Deepgram" (partials, barge-in works; the default) or
+                                     # "Telnyx" (in-house, finals-only: live captions show finals only and barge-in waits
+                                     # out the backchannel window on VAD alone; a startup log line says so). Case-sensitive, sent verbatim
+
+[minimax]
+api_key = ""
+voice_id = ""                        # Defaults to English_Graceful_Lady; 40+ languages available
+model = ""                           # Defaults to speech-2.6-turbo (low latency)
+# base_url = ""                      # Defaults to https://api.minimax.io/v1; mainland-China accounts use https://api.minimaxi.com/v1
+
+[vibevoice]
+asr_url = "ws://127.0.0.1:8200"
+tts_url = "http://127.0.0.1:8300"
+voice = "en-Emma_woman"
+
+# RAG is optional — omit the [rag] section to disable it entirely.
+# [rag]
+# provider = "supabase"       # "pgvector" or "supabase"
+# top_k = 3
+# embedding_model = "text-embedding-3-small"
+
+# [pgvector]
+# connection_string = "postgres://user:pass@localhost:5432/mydb"
+# table = "documents"
+
+# [supabase]
+# url = "https://xxx.supabase.co"
+# api_key = ""
+# function = "match_documents"
+# table = "documents"
+```
+
+Notes:
+
+- `server.public_ip` plus `server.turn_secret` enables the built-in Pion STUN/TURN server, replacing an external coturn container. TURN listens on UDP and TCP 3478 and relays media on UDP 50001–60000.
+- `server.max_sessions` bounds the blast radius of distributed clients: the per-IP rate limit cannot, and every session burns CPU and provider spend. Past the cap, `POST /whip` returns 503 with `Retry-After`; session resumes are exempt, since they reattach to a session that is already counted. Size it to what one instance can actually serve.
+- `debug.bind` enables Go's pprof handlers on a separate listener. Keep it on loopback and reach it through an SSH tunnel. The public server never serves `/debug/pprof/`.
+- `debug.allow_public` is only for network-isolated deployments. There is no authentication on the listener. With `debug.allow_public = true` on a reachable interface, `/debug/pprof/profile?seconds=3600` is an anonymous CPU-pinning DoS, and a heap dump from this server can contain provider API keys, caller audio buffers and transcripts. A non-loopback bind is rejected unless this flag is set.
+- `debug.block_profile_rate` and `debug.mutex_profile_fraction` enable the corresponding runtime profiles while the debug listener is active. Both default to `0` (off); set either to `1` to record every event while diagnosing contention.
+- `plugins.directory` is required for plugins and skills to load; omit it and discovery is skipped.
+- `plugins.config.<name>` is handed to that plugin at startup, so a plugin's credentials live in this file rather than in a dotenv beside its source. Quote a name containing a dot: `[plugins.config."weather.get"]`. Two keys are read by the server rather than passed through — `enabled` turns a plugin off without deleting it, and `timeout_ms` overrides the manifest's.
+- `display.*`, `github.*` and `codex.*` configure features that now ship as plugins — `display-projector`, `github` and `codex`. The server forwards each section to its plugin, so an existing deployment keeps working unchanged; an explicit `[plugins.config.<name>]` takes precedence when you move over. GitHub and Codex are separate plugins and are enabled independently, as the two sections always implied.
+- `github.*` turns on the GitHub App integration: CI failure investigation, repository reads, and confirmation-gated pull request creation. It needs an App private key, not a personal access token. See [Developer agent](./developer-agent.md).
+- `github.repositories` is an allowlist. A repository must be listed **and** reachable by the App installation before any call is made; either alone is not enough.
+- `codex.*` turns on the Codex developer agent. Codex authenticates with your ChatGPT subscription through the official sign-in flow — there is no API key setting and `OPENAI_API_KEY` is never used.
+- `codex.model_provider` and `codex.model` are pinned on the Codex command line. Without them a `~/.codex/config.toml` pointing at another provider would quietly take over, and your ChatGPT plan would never be touched.
+- `codex.workspace_root` is the only place Codex can write. Each developer task gets its own git worktree under it; the live server checkout is never one of them.
+- `pipeline.barge_in` lets users interrupt the agent while it is speaking. Agent audio ducks as soon as the caller starts talking over it and recovers if the interruption turns out to be a backchannel.
+- `pipeline.greeting` plays when a session connects. `pipeline.greeting_outgoing` is used for outbound SIP calls when present.
+- `pipeline.debug = true` emits timing events over the DataChannel and logs a per-turn latency breakdown.
+- `pipeline.turn_merge_ms` is how long a final transcript is held so a continuation can merge into the same turn. Raise it if the agent answers callers halfway through a sentence; lower it if replies feel sluggish. The wait extends automatically when the text ends mid-dictation or on a dangling word.
+- `pipeline.user_speech_quiet_ms` is how long the caller must be quiet before the agent starts speaking.
+- `pipeline.rag_prefetch` overlaps retrieval with the turn-merge window. Off by default; it issues a speculative embedding + search that is discarded if the turn text changes.
+- `pipeline.readback_bargein_guard_enabled` keeps weak corrections and backchannels from cutting off a confirmation readback. Only explicit commands (stop, cancel, hang up) interrupt. Off by default.
+- `pipeline.echo_guard` stops the agent barging in on its own voice. A browser runs AEC before audio reaches the server, so the VAD never sees the agent's output come back; over a carrier there is no AEC anywhere in the path, the returning audio is attenuated but structurally identical to speech, and an energy test cannot tell it from a caller. The guard keeps a rolling window of the RMS the server actually sent and requires inbound to clear `sent_rms x echo_guard_gain x echo_guard_margin` before it counts as an interruption. While the agent is silent that bound is zero and the ordinary adaptive threshold governs, so a quiet caller on a clean line is unaffected.
+
+  The decision is per session, because one instance usually serves browsers and SIP calls at once and the two need opposite answers. A client declares a raw path by adding `aec=none` to the WHIP URL, which `sip-server` sends on every call; browsers send nothing and are read as already cancelled.
+
+  | `echo_guard` | Effect |
+  | --- | --- |
+  | `"auto"` (default) | On for peers that sent `aec=none`, off for everyone else |
+  | `"always"` | On for every peer. For a raw-path client you cannot change to send the hint |
+  | `"off"` | Never on |
+
+  Leave it on `"auto"` unless you have a client on a path with no AEC that you cannot modify. Setting `"always"` on a server that also hosts browsers makes genuine browser barge-ins clear the agent's own output level first, which is the regression the per-session default exists to avoid.
+- `pipeline.echo_guard_gain`, `pipeline.echo_guard_margin`, and `pipeline.echo_guard_window_ms` tune that bound, for the sessions it applies to. The gain is how loud echo can be relative to the audio that produced it, the margin is what separates double-talk from echo, and the window should cover the round trip of the carrier's echo. The defaults (0.6, 1.8, 400ms) were measured on an 8kHz mu-law path; retune only against recordings of your own. The bound follows the barge-in duck on its own, since it is sampled from what goes on the wire after attenuation.
+- `deepgram.endpointing` and `deepgram.utterance_end_ms` tune when a turn is considered finished upstream; the turn-merge debounce runs on top of them.
+- `deepgram.tts_model` picks the Aura voice; STT (`model`) and TTS (`tts_model`) share the one API key. Voices are named `[family]-[voice]-[language]` — see [Deepgram's voice list](https://developers.deepgram.com/docs/tts-models).
+- `openai.stt_model` selects the batch transcription model independently of the chat `model`; it defaults to `whisper-1`.
+- `cartesia.max_concurrency` should match your plan's TTS concurrency limit — Cartesia counts active generations, not calls, and returns 429 past the limit.
+- `minimax.base_url` selects the region. Leave it unset for the global endpoint; mainland-China accounts must point it at `https://api.minimaxi.com/v1`, since keys do not work across the two platforms.
+- `minimax.model` must match your plan: a Token Plan key (`sk-cp-`) only covers `speech-2.8-hd`, while any other model bills pay-as-you-go and errors with `2056` on a zero balance.
+
+With `debug.bind = "127.0.0.1:6060"`, collect the profiles most useful for a long-running server with:
+
+```bash
+go tool pprof http://localhost:6060/debug/pprof/heap
+go tool pprof http://localhost:6060/debug/pprof/profile  # collects a 30-second CPU profile
+curl 'http://localhost:6060/debug/pprof/goroutine?debug=2'
+```
+
+## Profiling in containers
+
+On a Docker bridge network, `127.0.0.1` is the container's own loopback, not the
+host's. Publishing `-p 6060:6060` does not make a listener bound only to that
+loopback reachable from the host: forwarded traffic reaches the container's
+network interface instead.
+
+### Keep the listener private and collect inside the container
+
+Keep these settings in the mounted `config.toml`, then restart the container:
+
+```toml
+[debug]
+bind = "127.0.0.1:6060"
+allow_public = false
+```
+
+For a running container named `streamcore`, collect a heap profile without
+publishing port 6060. The repository's [Dockerfile](../Dockerfile) includes
+Python 3; Go only needs to be installed on the machine inspecting the profile:
+
+```bash
+umask 077
+docker exec -i streamcore python3 - > heap.pb.gz <<'PY'
+import sys
+import urllib.request
+
+with urllib.request.urlopen("http://127.0.0.1:6060/debug/pprof/heap", timeout=30) as response:
+    sys.stdout.buffer.write(response.read())
+PY
+go tool pprof heap.pb.gz
+```
+
+Do not add `-t`: a pseudo-terminal is unnecessary for a binary profile. Keep
+profile files private; they can contain sensitive process data. Use the actual
+container name when it differs from this example.
+
+### Publish to host loopback only when necessary
+
+For a temporary debugging container on a dedicated bridge network, the listener
+must accept traffic on the container interface. This requires the explicit
+acknowledgement below; `allow_public` does **not** add authentication:
+
+```toml
+[debug]
+bind = "0.0.0.0:6060"
+allow_public = true
+```
+
+With the image built as in the [quick start](./quickstart.md), create the
+container with an explicit host-loopback mapping:
+
+```bash
+docker network create streamcore-debug
+docker run --rm --name streamcore-profile --network streamcore-debug \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:6060:6060 \
+  -v "$(pwd)/config.toml:/config.toml:ro" \
+  streamcore-server
+```
+
+From another terminal on the Docker host, the profiling commands above can use
+`http://127.0.0.1:6060`. Do not replace the debug mapping with `-p 6060:6060`,
+which publishes on all host interfaces by default. Use Docker Engine 28.0.0 or
+newer for this mapping; older releases have a documented
+[localhost-publishing exposure](https://docs.docker.com/engine/network/port-publishing/).
+
+Host-loopback publishing is not isolation from other containers on the
+[same bridge network](https://docs.docker.com/engine/network/drivers/bridge/):
+they can still reach `6060` on the container interface. Do not attach untrusted
+containers, enable direct routing to the debug listener, or put it behind a
+public proxy. Prefer the `docker exec` approach when those restrictions cannot
+be guaranteed. Remove the temporary network with `docker network rm
+streamcore-debug` after the container has stopped.
+
+With Linux [`--network host`](https://docs.docker.com/engine/network/drivers/host/),
+there is no separate container network namespace. Keep
+`bind = "127.0.0.1:6060"` and `allow_public = false`; reach it on the host
+loopback, or through an SSH tunnel to that host. Port-publishing flags are ignored
+in host mode. After profiling, set `bind = ""` and restart to disable the listener.
+
+## Secrets from environment variables
+
+Every secret can be injected as an environment variable instead of written into `config.toml`, which is what container and cloud deployments need to keep keys out of images and files. A set variable **overrides** the file value — the deployment environment is more authoritative than a baked-in config — and each override is logged by name (never by value) at startup. An empty variable is treated as unset.
+
+Provider keys use each provider's conventional variable name; secrets owned by this server use a `STREAMCORE_` prefix:
+
+| Environment variable | Overrides |
+|---|---|
+| `STREAMCORE_TURN_SECRET` | `server.turn_secret` |
+| `STREAMCORE_JWT_SECRET` | `server.jwt_secret` |
+| `STREAMCORE_API_KEY` | `server.api_key` |
+| `STREAMCORE_AGENT_API_KEY` | `agent.api_key` |
+| `DEEPGRAM_API_KEY` | `deepgram.api_key` |
+| `ASSEMBLYAI_API_KEY` | `assemblyai.api_key` |
+| `ALIYUN_API_KEY` | `aliyun.api_key` |
+| `VOLCENGINE_API_KEY` | `volcengine.api_key` |
+| `OPENAI_API_KEY` | `openai.api_key` |
+| `XAI_API_KEY` | `grok.api_key` |
+| `CARTESIA_API_KEY` | `cartesia.api_key` |
+| `ELEVENLABS_API_KEY` | `elevenlabs.api_key` |
+| `SPEECHIFY_API_KEY` | `speechify.api_key` |
+| `TELNYX_API_KEY` | `telnyx.api_key` |
+| `MINIMAX_API_KEY` | `minimax.api_key` |
+| `MIMO_API_KEY` | `mimo.api_key` |
+| `SUPABASE_API_KEY` | `supabase.api_key` |
+| `PGVECTOR_CONNECTION_STRING` | `pgvector.connection_string` |
+
+Non-secret settings (models, voices, tunables) stay in `config.toml` only.
+
+Provider-specific behaviour and caveats: [Providers](./providers.md).

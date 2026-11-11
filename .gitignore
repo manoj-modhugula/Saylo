@@ -1,0 +1,67 @@
+# Node (plugin packages under plugins/)
+node_modules/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+# Terraform state and variable files carry IPs, key names, and sometimes
+# secrets in cleartext; keep only *.tfvars.example tracked
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform/
+plugins/plugins/*/.env
+plugins/plugins/*/.env.*
+plugins/plugins/*/.venv
+plugins/plugins/*/token.json
+external/vibeVoice/.venv
+# Local server config (API keys); keep *example* files tracked
+config.toml
+
+# Go build / test artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+__debug_bin
+*.a
+
+# Coverage
+*.coverprofile
+coverage.*
+profile.cov
+
+# Optional vendoring
+vendor/
+
+# Go workspace (if used locally at repo root)
+go.work
+go.work.sum
+
+# Logs
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+# Call reports (saylo report)
+/reports/
+
+# Static portfolio export
+/dist/
+/artifacts/
+
+/.chatgpt-preview/
+/saylo-chatgpt*.tar.gz
+
+# Project-local backend toolchain and dependency caches
+/.local-tools/

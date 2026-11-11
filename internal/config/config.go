@@ -1,0 +1,943 @@
+package config
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/BurntSushi/toml"
+)
+
+// Config is the top-level application configuration. Each provider (Deepgram,
+// OpenAI, Cartesia, etc.) has its own section. The [stt], [llm], and [tts]
+// sections select which provider to use for each role.
+//
+// Setting [realtime] provider switches the pipeline to a speech-to-speech
+// model that replaces all three roles at once; [stt], [llm], and [tts] are
+// then unused.
+type Config struct {
+	Server     ServerConfig     `toml:"server"`
+	Debug      DebugConfig      `toml:"debug"`
+	Reports    ReportsConfig    `toml:"reports"`
+	Plugins    PluginsConfig    `toml:"plugins"`
+	Display    DisplayConfig    `toml:"display"`
+	GitHub     GitHubConfig     `toml:"github"`
+	Codex      CodexConfig      `toml:"codex"`
+	Pipeline   PipelineConfig   `toml:"pipeline"`
+	Realtime   RealtimeConfig   `toml:"realtime"`
+	Grok       GrokConfig       `toml:"grok"`
+	STT        STTConfig        `toml:"stt"`
+	LLM        LLMConfig        `toml:"llm"`
+	TTS        TTSConfig        `toml:"tts"`
+	RAG        RAGConfig        `toml:"rag"`
+	Deepgram   DeepgramConfig   `toml:"deepgram"`
+	Sarvam     SarvamConfig     `toml:"sarvam"`
+	AssemblyAI AssemblyAIConfig `toml:"assemblyai"`
+	Groq       GroqConfig       `toml:"groq"`
+	OpenAI     OpenAIConfig     `toml:"openai"`
+	Ollama     OllamaConfig     `toml:"ollama"`
+	Agent      AgentConfig      `toml:"agent"`
+	VibeVoice  VibeVoiceConfig  `toml:"vibevoice"`
+	Volcengine VolcengineConfig `toml:"volcengine"`
+	Aliyun     AliyunConfig     `toml:"aliyun"`
+	Cartesia   CartesiaConfig   `toml:"cartesia"`
+	ElevenLabs ElevenLabsConfig `toml:"elevenlabs"`
+	Speechify  SpeechifyConfig  `toml:"speechify"`
+	Telnyx     TelnyxConfig     `toml:"telnyx"`
+	MiniMax    MiniMaxConfig    `toml:"minimax"`
+	MiMo       MiMoConfig       `toml:"mimo"`
+	Pgvector   PgvectorConfig   `toml:"pgvector"`
+	Supabase   SupabaseConfig   `toml:"supabase"`
+}
+
+// ReportsConfig: per-call reports for `saylo report`. Numbers and labels
+// only, never what was said, so they're on unless turned off.
+type ReportsConfig struct {
+	Enabled *bool  `toml:"enabled"` // default true
+	Dir     string `toml:"dir"`     // default "reports"
+}
+
+// On reports whether call reports are written.
+func (r ReportsConfig) On() bool { return r.Enabled == nil || *r.Enabled }
+
+type DebugConfig struct {
+	Bind                 string `toml:"bind"`
+	AllowPublic          bool   `toml:"allow_public"`
+	BlockProfileRate     int    `toml:"block_profile_rate"`
+	MutexProfileFraction int    `toml:"mutex_profile_fraction"`
+}
+
+type PluginsConfig struct {
+	Directory string `toml:"directory"`
+
+	// Config holds each plugin's own settings, keyed by the name in its
+	// manifest, and is handed to that plugin at startup. It keeps a plugin's
+	// credentials in the operator's one config file rather than in a dotenv
+	// next to its source:
+	//
+	//	[plugins.config."github"]
+	//	app_id = "123456"
+	Config map[string]map[string]any `toml:"config"`
+}
+
+type DisplayConfig struct {
+	// Enabled is false by default: display projection is additive and must not
+	// change behavior for deployments that have not asked for it.
+	Enabled bool `toml:"enabled"`
+	// Plugin names the event plugin that projects completed turns. Empty uses
+	// the built-in display-projector.
+	Plugin string `toml:"plugin"`
+
+	Projector DisplayProjectorConfig `toml:"projector"`
+}
+
+type DisplayProjectorConfig struct {
+	// TimeoutMs bounds one projection, including its model call.
+	TimeoutMs int `toml:"timeout_ms"`
+	// FastPathMaxChars is the largest simple response projected locally.
+	FastPathMaxChars int `toml:"fast_path_max_chars"`
+}
+
+// GitHubConfig is the GitHub App credential and the repositories StreamCore is
+// allowed to touch. There is no personal access token: the App private key,
+// exchanged for short-lived installation tokens, is the only credential.
+type GitHubConfig struct {
+	Enabled bool `toml:"enabled"`
+
+	// AppID is the JWT issuer. GitHub accepts either the numeric App ID or the
+	// App's client ID, and recommends the client ID.
+	AppID string `toml:"app_id"`
+
+	InstallationID string `toml:"installation_id"`
+
+	// PrivateKeyPath points at the App's PEM. It is read once at startup and
+	// never leaves the server: not into a prompt, a tool result, a DataChannel
+	// message, or a log line.
+	PrivateKeyPath string `toml:"private_key_path"`
+
+	// Repositories is the allowlist, as owner/name. A repository must be here
+	// *and* reachable by the App installation before any call is made.
+	Repositories []string `toml:"repositories"`
+
+	// APIBaseURL overrides https://api.github.com for GitHub Enterprise Server.
+	APIBaseURL string `toml:"api_base_url"`
+}
+
+// CodexConfig points at the Codex harness. There is deliberately no api_key
+// field: Codex authenticates with the operator's ChatGPT sign-in, which Codex
+// itself owns, and StreamCore never holds those credentials.
+type CodexConfig struct {
+	Enabled bool `toml:"enabled"`
+
+	// Binary is the Codex CLI to launch as an App Server.
+	Binary string `toml:"binary"`
+
+	// ModelProvider and Model are pinned on the command line rather than left
+	// to ~/.codex/config.toml. An operator whose Codex defaults point at a
+	// third-party provider would otherwise get a StreamCore that never touches
+	// their ChatGPT subscription and never says so.
+	ModelProvider string `toml:"model_provider"`
+	Model         string `toml:"model"`
+
+	// WorkspaceRoot is where isolated worktrees live. Codex can write here and
+	// nowhere else; the live StreamCore checkout is never one of them.
+	WorkspaceRoot string `toml:"workspace_root"`
+
+	// TurnTimeoutMs bounds one Codex turn before it is interrupted.
+	TurnTimeoutMs int `toml:"turn_timeout_ms"`
+
+	// NetworkAccess opens the task sandbox to the network. Off by default;
+	// turn it on only when the repository's tests fetch dependencies.
+	NetworkAccess bool `toml:"network_access"`
+
+	// Config passes extra `-c key=value` overrides to the App Server.
+	Config []string `toml:"config"`
+}
+
+type PipelineConfig struct {
+	BargeIn          *bool  `toml:"barge_in"`
+	Greeting         string `toml:"greeting"`          // Text spoken by the agent when a user connects
+	GreetingOutgoing string `toml:"greeting_outgoing"` // Text spoken on outgoing SIP calls (falls back to greeting)
+	Debug            bool   `toml:"debug"`             // Emit per-turn timing events over the DataChannel
+
+	// GreetingDelayMs, when set, holds the configured greeting for up to
+	// this long to let the caller speak first -- someone who picks up and
+	// says "hello?" gets answered instead of talked over by a scripted
+	// line. If the caller's first turn arrives before the delay elapses,
+	// the greeting is skipped entirely and that turn flows through the
+	// normal agent path instead; if not, the greeting fires exactly as it
+	// always has. 0 (default) preserves today's immediate-greeting
+	// behaviour unchanged.
+	GreetingDelayMs int `toml:"greeting_delay_ms"`
+
+	// GreetingSpeechSettleMs is how long after the caller last made sound a
+	// delayed greeting keeps waiting for their first turn to arrive, before
+	// deciding the sound was noise and greeting anyway. It has to cover the
+	// STT's end-of-speech-to-final latency: ~1-2s for streaming cloud STT,
+	// much longer for a batch or CPU-bound local engine. 0 means 5000.
+	GreetingSpeechSettleMs int `toml:"greeting_speech_settle_ms"`
+
+	// GreetingFromAgent asks the LLM client for the opening line (see
+	// llm.Greeter -- today only llm.provider = "agent" implements it)
+	// instead of speaking the static greeting, so an outbound call can open
+	// with the person's name and the reason for the call. The static
+	// greeting, if set, is the fallback when the agent errors or returns
+	// nothing. Off by default: an existing agent endpoint that doesn't
+	// understand "greeting" requests never receives one.
+	GreetingFromAgent bool `toml:"greeting_from_agent"`
+
+	// UserSpeechQuietMs is how long the caller must be quiet before the agent
+	// starts speaking. It stops the agent talking over someone who is still
+	// mid-thought after the transcript went final.
+	UserSpeechQuietMs int `toml:"user_speech_quiet_ms"`
+
+	// TurnMergeMs is the debounce window for merging consecutive final
+	// transcripts into a single turn. A caller who pauses mid-sentence
+	// ("I want to... um... book a table") otherwise fires two turns and the
+	// agent answers the first half.
+	TurnMergeMs int `toml:"turn_merge_ms"`
+
+	// ReadbackBargeInGuardEnabled suppresses weak correction/backchannel
+	// barge-ins ("yeah", "mm-hm", "no that's wrong") while the agent is
+	// reading values back for confirmation. Only strong commands (stop,
+	// cancel, hang up) cut through. Default off, preserving existing
+	// barge-in behaviour.
+	ReadbackBargeInGuardEnabled bool `toml:"readback_bargein_guard_enabled"`
+
+	// EchoGuard keeps the barge-in VAD from hearing the agent's own voice
+	// coming back. It bounds the interrupt threshold by the RMS of what the
+	// server just sent, which is the only echo reference available when
+	// nothing in the path runs AEC.
+	//
+	// The choice is per session, not per server: one instance commonly serves
+	// browsers and SIP calls at once, and the two need opposite answers. A
+	// browser cancels echo in getUserMedia, so the bound would block nothing
+	// it was going to catch while making a genuine barge-in clear the agent's
+	// own level first. A carrier leg has no AEC anywhere.
+	//
+	//	"auto"   — on for peers that arrive with aec=none, off otherwise (default)
+	//	"always" — on for every peer, for clients that cannot send the hint
+	//	"off"    — never
+	EchoGuard string `toml:"echo_guard"`
+
+	// EchoGuardGain bounds echo against the audio that produced it (echo
+	// cannot be louder than its source), and EchoGuardMargin is how far
+	// inbound must clear that bound to count as the caller talking rather
+	// than the agent's tail. Default 0.6 and 1.8; retune only against
+	// recordings of the actual path.
+	EchoGuardGain   float64 `toml:"echo_guard_gain"`
+	EchoGuardMargin float64 `toml:"echo_guard_margin"`
+
+	// EchoGuardWindowMs is how long outbound audio stays in the reference
+	// window, sized to cover the round trip of the carrier's echo. Default
+	// 400. Too short and the tail of a phrase escapes the bound; too long
+	// and the agent stays hard to interrupt after it has stopped talking.
+	EchoGuardWindowMs int `toml:"echo_guard_window_ms"`
+
+	// RAGPrefetch starts retrieval speculatively during the turn-merge
+	// window so embedding and vector search overlap the debounce instead of
+	// adding to it.
+	RAGPrefetch bool `toml:"rag_prefetch"`
+}
+
+type ServerConfig struct {
+	Port       string `toml:"port"`
+	PublicIP   string `toml:"public_ip"`   // Public IP for ICE candidates when behind NAT (e.g., EC2). Leave empty for local/direct connections.
+	TurnSecret string `toml:"turn_secret"` // Shared secret for the built-in TURN server. Required when public_ip is set.
+	JWTSecret  string `toml:"jwt_secret"`  // Shared secret for HMAC-SHA256 JWT validation on /whip. Leave empty to disable auth.
+	APIKey     string `toml:"api_key"`     // API key required to call /token. Leave empty to allow unauthenticated token generation.
+
+	// MaxSessions caps live sessions across all clients. The per-IP rate limit
+	// cannot bound distributed clients, and every session burns CPU and
+	// provider spend, so this is the global backstop: past the cap, POST /whip
+	// returns 503 with a Retry-After. Zero (the default) means unlimited.
+	MaxSessions int `toml:"max_sessions"`
+
+	// SessionGraceMs is how long a session with no connected peers is kept
+	// before the reaper closes it. The window is what lets a client recover a
+	// dropped connection — via ICE restart or a redial — without losing the
+	// conversation. Too short and a network handover costs the call; too long
+	// and abandoned sessions pile up. Defaults to 30000.
+	SessionGraceMs int `toml:"session_grace_ms"`
+}
+
+// RealtimeConfig selects a speech-to-speech provider. When Provider is set,
+// the pipeline runs in realtime mode: audio goes straight to the model and
+// comes back as audio, so [stt], [llm], and [tts] are bypassed entirely.
+// Empty (the default) keeps the classic STT -> LLM -> TTS pipeline.
+type RealtimeConfig struct {
+	Provider string `toml:"provider"`
+}
+
+// GrokConfig configures xAI's Grok speech-to-speech model over the Realtime
+// WebSocket API (wss://api.x.ai/v1/realtime). Used when realtime.provider is
+// "grok".
+type GrokConfig struct {
+	APIKey string `toml:"api_key"`
+	// Model is the voice model. "grok-voice-latest" always tracks the newest
+	// one; pin a versioned name (e.g. "grok-voice-think-fast-2.0") in
+	// production so a model change never lands unannounced.
+	Model string `toml:"model"`
+	// Voice is a built-in voice ID (lowercase, e.g. "eve") or a custom voice
+	// ID from the Custom Voices API. Empty uses the model default.
+	Voice string `toml:"voice"`
+	// SystemPrompt maps to the session `instructions`. Grok voice models are
+	// strong enough that a short prompt beats a ported-over GPT one — xAI
+	// explicitly recommends stripping workaround prompting.
+	SystemPrompt string `toml:"system_prompt"`
+	// ReasoningEffort is "high" (default, better on multi-step instructions
+	// and ambiguous queries) or "none" (lower latency).
+	ReasoningEffort string `toml:"reasoning_effort"`
+
+	// --- Server-side turn detection ---
+
+	// VADThreshold is the activation threshold in 0.1-0.9. Higher demands
+	// louder audio to trigger a turn. Zero leaves the provider default (0.85).
+	VADThreshold float64 `toml:"vad_threshold"`
+	// SilenceDurationMs is how long the caller must be silent before the
+	// server ends their turn (0-10000). Zero leaves the provider default.
+	SilenceDurationMs int `toml:"silence_duration_ms"`
+	// PrefixPaddingMs is how much audio before the detected speech onset to
+	// include, so the first word is not clipped. Zero leaves the default (333).
+	PrefixPaddingMs int `toml:"prefix_padding_ms"`
+	// IdleTimeoutMs makes the agent proactively re-engage after this much
+	// silence. Zero disables the proactive check-in.
+	IdleTimeoutMs int `toml:"idle_timeout_ms"`
+
+	// --- Input transcription (for the client-facing transcript only) ---
+
+	// Transcription enables grok-transcribe on the caller's audio so the
+	// DataChannel still receives user transcripts. The model itself hears the
+	// audio directly and does not need this; it costs an extra transcription
+	// pass. Nil means enabled.
+	Transcription *bool `toml:"transcription"`
+	// LanguageHint biases transcription to a BCP-47 language. Spanish and
+	// Portuguese need a regional variant ("es-MX", "pt-BR"); bare "es"/"pt"
+	// are rejected. Unrecognised codes fall back to auto-detection.
+	LanguageHint string `toml:"language_hint"`
+	// Keyterms bias transcription toward domain vocabulary, mirroring the
+	// Deepgram and AssemblyAI options. Up to 100 terms, 50 chars each.
+	Keyterms []string `toml:"keyterms"`
+
+	// --- Server-side tools ---
+
+	// WebSearch and XSearch enable xAI's hosted search tools. These run on
+	// xAI's side and need no local plugin.
+	WebSearch bool `toml:"web_search"`
+	XSearch   bool `toml:"x_search"`
+}
+
+type STTConfig struct {
+	Provider string `toml:"provider"`
+	// Failover is the ordered provider list used when Provider is
+	// "failover": the first that connects serves the call, and a mid-call
+	// failure moves on to the next.
+	Failover []string `toml:"failover"`
+	// Adaptive configures provider "adaptive": the listener is chosen per
+	// call and switched mid-call when the caller's language needs another.
+	Adaptive AdaptiveConfig `toml:"adaptive"`
+}
+
+// AdaptiveConfig is [stt.adaptive]. Each listener is a failover chain.
+type AdaptiveConfig struct {
+	// World is the default listener, for callers in any language Deepgram's
+	// multilingual model hears (default ["deepgram"]).
+	World []string `toml:"world"`
+	// Indian is the listener after a turn is identified as a regional Indian
+	// language -- Tamil, Telugu, Bengali... (default ["sarvam", "deepgram"]).
+	Indian []string `toml:"indian"`
+	// Identify lists who identifies the language of a turn the listener may
+	// have misheard, in order: "groq" (Whisper), "sarvam" (default both).
+	Identify []string `toml:"identify"`
+	// IdentifyModel is the Groq Whisper model (default "whisper-large-v3";
+	// the turbo model mislabels Indian languages).
+	IdentifyModel string `toml:"identify_model"`
+	// HindiConfidence: a Deepgram "hi" turn below it is checked -- regional
+	// Indian languages come back as Hindi-looking text at 0.70-0.95, real
+	// Hindi at 0.99+ (default 0.97).
+	HindiConfidence float64 `toml:"hindi_confidence"`
+	// MinConfidence: any Deepgram turn below it is checked (default 0.85).
+	MinConfidence float64 `toml:"min_confidence"`
+}
+
+// GroqConfig holds the key for Groq's Whisper, used to identify languages.
+type GroqConfig struct {
+	APIKey string `toml:"api_key"`
+}
+
+type LLMConfig struct {
+	Provider string `toml:"provider"`
+}
+
+type TTSConfig struct {
+	Provider string `toml:"provider"`
+
+	// Failover is the ordered provider list when Provider is "failover":
+	// each sentence goes to the first available provider, and moves on when
+	// one errors, is rate limited or out of credit, or doesn't start
+	// speaking within FirstAudioTimeoutMs. Order by preference or cost.
+	Failover []string `toml:"failover"`
+	// Languages overrides the order per language ([tts.languages] hi =
+	// ["cartesia", "vibevoice"]), read from a sentence's "[lang:xx]" tag.
+	Languages map[string][]string `toml:"languages"`
+	// FirstAudioTimeoutMs: no audio from a provider within this (default
+	// 3000) and the sentence goes to the next one.
+	FirstAudioTimeoutMs int `toml:"first_audio_timeout_ms"`
+	// CooldownMs: how long a provider that failed is skipped (default
+	// 30000; out of credit: 10 min; key rejected: until restart).
+	CooldownMs int `toml:"cooldown_ms"`
+	// ClientChoice lets a call ask for one of the configured voices
+	// (?voice=cartesia on the WHIP URL), which then goes first in the chain
+	// for that call. Off by default: a client could otherwise choose the
+	// most expensive voice. Only voices already configured can be chosen.
+	ClientChoice bool `toml:"client_choice"`
+}
+
+// SarvamConfig is Sarvam AI's speech-to-text (https://docs.sarvam.ai),
+// strongest on Indian languages. Streaming over a WebSocket by default
+// (internal/stt/sarvam_stream.go); mode = "rest" uploads one utterance at a
+// time instead (internal/stt/sarvam.go). Both emit finals only.
+type SarvamConfig struct {
+	APIKey       string `toml:"api_key"`
+	Mode         string `toml:"mode"`          // "stream" (default) or "rest"
+	StreamModel  string `toml:"stream_model"`  // streaming model, default "saarika:v2.5"
+	Model        string `toml:"model"`         // REST model: "saaras:v3" (default) or "saaras:v4"
+	LanguageCode string `toml:"language_code"` // BCP-47, e.g. "hi-IN", "en-IN", or "unknown" to auto-detect
+}
+
+type DeepgramConfig struct {
+	APIKey string `toml:"api_key"`
+	Model  string `toml:"model"`
+	// Language is a BCP-47 tag (e.g. "en-US", "es-MX"). It is mapped to the
+	// language code the Nova-3 model expects; only languages checked against
+	// real audio pass through (see nova3Language), anything else becomes
+	// "multi". Empty defaults to English.
+	Language string `toml:"language"`
+	// Endpointing is how long (ms, as a string) Deepgram waits for silence
+	// before finalising a transcript. Lower is snappier but fragments natural
+	// mid-sentence pauses ("I want to… um… order a pizza").
+	Endpointing string `toml:"endpointing"`
+	// UtteranceEndMs asks Deepgram to emit an UtteranceEnd event after this
+	// much silence, which the callback uses to flush buffered chunks when no
+	// speech_final arrives. Deepgram requires >= 1000 and interim results.
+	UtteranceEndMs string `toml:"utterance_end_ms"`
+	// Keyterms bias the Nova-3 decoder toward domain vocabulary that is
+	// phonetically ambiguous against common English (product names, place
+	// names). Ignored by other models.
+	Keyterms []string `toml:"keyterms"`
+	// TTSModel selects the Aura voice used when tts.provider = "deepgram".
+	// Model is STT-only, so TTS gets its own field on the same section (both
+	// roles share one API key). Empty defaults to aura-2-thalia-en.
+	TTSModel string `toml:"tts_model"`
+}
+
+type AssemblyAIConfig struct {
+	APIKey string `toml:"api_key"`
+	// Model selects the Universal-Streaming speech model. Common values:
+	//   - "u3-rt-pro" (Universal-3 Pro, strongest entity capture)
+	//   - "u3-rt"     (Universal-3 baseline, cheaper)
+	Model string `toml:"model"`
+	// Language is a BCP-47 tag; the region is stripped before it is sent as
+	// AssemblyAI's `language_code` (which expects ISO 639-1). Empty lets the
+	// model auto-detect.
+	Language string `toml:"language"`
+	// FormatTurns enables auto-formatted text (capitalisation, punctuation)
+	// on the final turn. Nil means enabled.
+	FormatTurns *bool `toml:"format_turns"`
+	// EndOfTurnSilenceMs tunes how long the model waits before declaring the
+	// turn over. Zero leaves the provider default.
+	EndOfTurnSilenceMs int `toml:"end_of_turn_silence_ms"`
+	// Keyterms are passed as repeated keyterm_prompt parameters to bias the
+	// decoder, mirroring the Deepgram option.
+	Keyterms []string `toml:"keyterms"`
+}
+
+type OpenAIConfig struct {
+	APIKey string `toml:"api_key"`
+	Model  string `toml:"model"`
+	// STTModel selects the transcription model used when stt.provider =
+	// "openai". It is separate from Model because chat and transcription use
+	// different model families. Empty defaults to whisper-1.
+	STTModel     string `toml:"stt_model"`
+	SystemPrompt string `toml:"system_prompt"`
+	// BaseURL points the client at an OpenAI-compatible endpoint other than
+	// OpenAI's own — DeepSeek, Moonshot, Qwen and MiniMax all speak the same
+	// protocol and differ only by host and model name. Empty uses OpenAI.
+	//
+	// This is not the same as the ollama provider's base_url, which speaks
+	// Ollama's own /api/chat protocol; the two are not interchangeable.
+	BaseURL string `toml:"base_url"`
+}
+
+type OllamaConfig struct {
+	BaseURL      string `toml:"base_url"`
+	Model        string `toml:"model"`
+	SystemPrompt string `toml:"system_prompt"`
+}
+
+// AgentConfig points the pipeline at an external bring-your-own-agent HTTP
+// endpoint. Used when llm.provider = "agent". The endpoint owns the
+// conversation (memory, prompting, tool use) keyed by the session_id the
+// server sends with every turn.
+type AgentConfig struct {
+	URL    string `toml:"url"`
+	APIKey string `toml:"api_key"` // Sent as Authorization: Bearer. Empty disables auth.
+	// TimeoutMs bounds a whole turn round-trip, including streaming the
+	// reply. Zero means 60000.
+	TimeoutMs int `toml:"timeout_ms"`
+}
+
+type CartesiaConfig struct {
+	APIKey string `toml:"api_key"`
+	// Model is the Sonic model; empty means sonic-3.6. Pin a dated snapshot
+	// ("sonic-3.6-2026-08-27") to keep a voice from changing under you.
+	Model string `toml:"model"`
+	// VoiceID speaks languages with no voice of their own; empty means Katie
+	// (American English).
+	VoiceID string `toml:"voice_id"`
+	// Voices gives a language its own voice: hi = "<voice id>". Indian
+	// languages default to a voice native in each (see tts/cartesia_voices.go):
+	// a voice speaks other languages in its own accent.
+	Voices map[string]string `toml:"voices"`
+	// Locales overrides the locale sent with a language's sentences, which
+	// sets the accent and how numbers and dates are read: en = "en-IN".
+	// Indian languages default to "xx-IN", the rest to their base code.
+	Locales map[string]string `toml:"locales"`
+	// WSURL overrides the Cartesia WebSocket endpoint. Empty (the default)
+	// talks to wss://api.cartesia.ai/tts/websocket.
+	WSURL string `toml:"ws_url"`
+	// MaxConcurrency caps simultaneous in-flight generations. Cartesia counts
+	// concurrency by active generation context — not by call or connection —
+	// and returns 429 past the account limit, so set this to your plan's TTS
+	// concurrency limit and extra requests queue locally instead of failing.
+	// 0 (unset) defaults to 3; a negative value disables the limiter.
+	MaxConcurrency int `toml:"max_concurrency"`
+}
+
+type ElevenLabsConfig struct {
+	APIKey  string `toml:"api_key"`
+	VoiceID string `toml:"voice_id"`
+	Model   string `toml:"model"`
+}
+
+type SpeechifyConfig struct {
+	APIKey  string `toml:"api_key"`
+	VoiceID string `toml:"voice_id"`
+	Model   string `toml:"model"`
+}
+
+// TelnyxConfig configures Telnyx hosted speech, used when tts.provider =
+// "telnyx" and when stt.provider = "telnyx". One API key covers both roles.
+type TelnyxConfig struct {
+	APIKey string `toml:"api_key"`
+	// Voice is a catalog voice from GET /v2/text-to-speech/voices. Empty
+	// defaults to the Qwen3TTS voice Delta (Telnyx.Qwen3TTS.d9348e0d-988a-42cc-a64e-18093fe45c03). Availability varies by account, and
+	// a voice the account is not provisioned for fails the WebSocket
+	// handshake with HTTP 403.
+	Voice string `toml:"voice"`
+	// VoiceSpeed is a playback-rate multiplier (1.0 = normal), clamped to
+	// the 0.8-1.2 conversational band. Zero defaults to 1.0.
+	VoiceSpeed float64 `toml:"voice_speed"`
+	// TranscriptionEngine selects the recognizer used when stt.provider =
+	// "telnyx". The value is case-sensitive and sent to the endpoint
+	// verbatim. "Deepgram" (the default) streams partials, so barge-in and
+	// live captions work out of the box; the in-house "Telnyx" engine
+	// emits one final per utterance and no interims, so live captions show
+	// finals only and barge-in runs VAD-only after the backchannel window —
+	// a startup log line says so. Other engines the endpoint fronts
+	// (AssemblyAI, Azure, ...) pass through untested.
+	TranscriptionEngine string `toml:"transcription_engine"`
+}
+
+type MiMoConfig struct {
+	APIKey string `toml:"api_key"`
+	// Voice is a built-in voice name, passed through verbatim — the Chinese
+	// set (茉莉, 冰糖, 苏打, 白桦 …) and the English one (Mia, Chloe, Milo,
+	// Dean …) share this field.
+	Voice   string `toml:"voice"`
+	Model   string `toml:"model"`
+	BaseURL string `toml:"base_url"`
+}
+
+type MiniMaxConfig struct {
+	APIKey  string `toml:"api_key"`
+	VoiceID string `toml:"voice_id"`
+	Model   string `toml:"model"`
+	// BaseURL overrides the API host. Empty uses the global endpoint;
+	// mainland-China accounts need https://api.minimaxi.com/v1.
+	BaseURL string `toml:"base_url"`
+}
+
+type RAGConfig struct {
+	Provider       string `toml:"provider"`        // "pgvector", "supabase", or "" (disabled)
+	TopK           int    `toml:"top_k"`           // Number of chunks to retrieve (default 3)
+	EmbeddingModel string `toml:"embedding_model"` // OpenAI embedding model (default text-embedding-3-small)
+}
+
+type PgvectorConfig struct {
+	ConnectionString string `toml:"connection_string"`
+	Table            string `toml:"table"` // Table name (default "documents")
+}
+
+type SupabaseConfig struct {
+	URL      string `toml:"url"`      // Supabase project URL
+	APIKey   string `toml:"api_key"`  // Supabase anon or service_role key
+	Function string `toml:"function"` // RPC function name (default "match_documents")
+	Table    string `toml:"table"`    // Table name (default "documents"), used by streamcore-cli for ingestion
+}
+
+type VibeVoiceConfig struct {
+	ASRURL string `toml:"asr_url"` // WebSocket URL for the ASR server
+	TTSURL string `toml:"tts_url"` // HTTP URL for the TTS server
+	Voice  string `toml:"voice"`   // TTS voice name
+}
+
+// AliyunConfig configures Alibaba Cloud Model Studio (DashScope), which serves
+// both streaming ASR and streaming TTS from the same endpoint and key.
+type AliyunConfig struct {
+	APIKey string `toml:"api_key"`
+	// Model is the realtime recognition model. Empty uses
+	// paraformer-realtime-v2; fun-asr-realtime is the alternative.
+	Model string `toml:"model"`
+	// Language biases a multilingual model ("zh", "en"). Empty auto-detects.
+	Language string `toml:"language"`
+	// VocabularyID selects a hotword list created in the console, for domain
+	// terms the model keeps getting wrong.
+	VocabularyID string `toml:"vocabulary_id"`
+	// URL overrides the endpoint. Empty uses the public DashScope one.
+	URL string `toml:"url"`
+
+	// TTSModel is the synthesis model used when tts.provider = "aliyun".
+	// Empty uses cosyvoice-v2. Kept separate from Model because one [aliyun]
+	// section can drive both directions at once.
+	TTSModel string `toml:"tts_model"`
+	// Voice is the synthesis voice. Voices are tied to a model generation —
+	// a v1 voice on cosyvoice-v2 is rejected — so change both together.
+	Voice string `toml:"voice"`
+}
+
+// VolcengineConfig configures Volcengine (Doubao), which serves both
+// streaming ASR and streaming TTS from the same console API key.
+type VolcengineConfig struct {
+	// APIKey is the console's API key, sent as X-Api-Key. The older
+	// app-id-plus-access-token pair does not work against these resources.
+	APIKey string `toml:"api_key"`
+	// ResourceID selects the plan: volc.seedasr.sauc.duration bills by the
+	// hour, volc.seedasr.sauc.concurrent by concurrency. Empty uses duration.
+	ResourceID string `toml:"resource_id"`
+	Model      string `toml:"model"`
+	// URL overrides the endpoint. Empty uses the streaming bigmodel endpoint.
+	URL string `toml:"url"`
+	// EndWindowMs is the silence that ends an utterance, the same knob as
+	// [deepgram] endpointing. Empty uses 300.
+	EndWindowMs int `toml:"end_window_ms"`
+
+	// TTSResourceID selects the synthesis entitlement, kept separate from
+	// ResourceID because one [volcengine] section can drive both directions.
+	// Empty uses seed-tts-2.0; the 1.0 resource is activated separately.
+	TTSResourceID string `toml:"tts_resource_id"`
+	// Speaker is the synthesis voice. Voices belong to a model generation —
+	// the 2.0 resource takes the `_uranus_bigtts` voices and refuses the
+	// older `_moon_` / `_mars_` / `_jupiter_` ones — so change this and
+	// TTSResourceID together.
+	Speaker string `toml:"speaker"`
+	// TTSURL overrides the synthesis endpoint. Empty uses the bidirectional
+	// streaming one.
+	TTSURL string `toml:"tts_url"`
+}
+
+// Load reads configuration from a TOML file. It tries the given path first,
+// then falls back to "config.toml" in the working directory.
+func Load(path string) (*Config, error) {
+	if path == "" {
+		path = "config.toml"
+	}
+
+	cfg := &Config{}
+	if _, err := os.Stat(path); err == nil {
+		metadata, err := toml.DecodeFile(path, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse %s: %w", path, err)
+		}
+		if undecoded := metadata.Undecoded(); len(undecoded) > 0 {
+			keys := make([]string, len(undecoded))
+			for i, key := range undecoded {
+				keys[i] = key.String()
+			}
+			sort.Strings(keys)
+			log.Printf("Warning: unknown config key(s): %s — check for a typo", strings.Join(keys, ", "))
+		}
+	}
+
+	cfg.applyEnvOverrides()
+
+	// Apply defaults
+	setDefault(&cfg.Server.Port, "8080")
+	setDefault(&cfg.Reports.Dir, "reports")
+	if cfg.Server.SessionGraceMs == 0 {
+		cfg.Server.SessionGraceMs = 30000
+	}
+	setDefault(&cfg.STT.Provider, "deepgram")
+	setDefault(&cfg.Deepgram.Model, "nova-3")
+	// 300ms keeps the historical snappy endpointing. utterance_end_ms has no
+	// prior value; 1000 is Deepgram's minimum and switches on the UtteranceEnd
+	// flush that recovers a turn when no speech_final arrives.
+	setDefault(&cfg.Deepgram.Endpointing, "300")
+	setDefault(&cfg.Deepgram.UtteranceEndMs, "1000")
+	setDefault(&cfg.Deepgram.TTSModel, "aura-2-thalia-en")
+	setDefault(&cfg.AssemblyAI.Model, "u3-rt-pro")
+	// Cartesia counts concurrency by active generation context; 3 comfortably
+	// serves many concurrent calls because agent speech is bursty and
+	// half-duplex. Negative disables the limiter.
+	if cfg.Cartesia.MaxConcurrency == 0 {
+		cfg.Cartesia.MaxConcurrency = 3
+	}
+	if cfg.Telnyx.VoiceSpeed == 0 {
+		cfg.Telnyx.VoiceSpeed = 1.0
+	}
+	setDefault(&cfg.Telnyx.TranscriptionEngine, "Deepgram")
+	setDefault(&cfg.LLM.Provider, "openai")
+	setDefault(&cfg.TTS.Provider, "cartesia")
+	setDefault(&cfg.OpenAI.Model, "gpt-4o-mini")
+	setDefault(&cfg.OpenAI.STTModel, "whisper-1")
+	setDefault(&cfg.OpenAI.SystemPrompt, "You are a helpful AI voice assistant having a natural phone conversation. Keep responses to 1-2 sentences unless asked for detail. When interrupted (indicated by bracketed context), respond the way a patient human would: if they say 'no', address the disagreement; if they redirect, follow their lead. Never repeat what you already said, never ask 'would you like me to continue', and never mention that you were interrupted.")
+	setDefault(&cfg.Ollama.BaseURL, "http://localhost:11434")
+	setDefault(&cfg.Ollama.Model, "llama3.2")
+	setDefault(&cfg.Ollama.SystemPrompt, "You are a helpful AI voice assistant having a natural phone conversation. Keep responses to 1-2 sentences unless asked for detail. When interrupted (indicated by bracketed context), respond the way a patient human would: if they say 'no', address the disagreement; if they redirect, follow their lead. Never repeat what you already said, never ask 'would you like me to continue', and never mention that you were interrupted.")
+	setDefault(&cfg.VibeVoice.ASRURL, "ws://127.0.0.1:8200")
+	setDefault(&cfg.VibeVoice.TTSURL, "http://127.0.0.1:8300")
+
+	setDefault(&cfg.Display.Plugin, "display-projector")
+	if cfg.Display.Projector.TimeoutMs == 0 {
+		cfg.Display.Projector.TimeoutMs = 3000
+	}
+	if cfg.Display.Projector.FastPathMaxChars == 0 {
+		cfg.Display.Projector.FastPathMaxChars = 80
+	}
+	if cfg.Display.Projector.TimeoutMs < 0 || cfg.Display.Projector.FastPathMaxChars < 0 {
+		return nil, fmt.Errorf("[display.projector] timeout_ms and fast_path_max_chars must be positive")
+	}
+	setDefault(&cfg.VibeVoice.Voice, "en-Emma_woman")
+
+	setDefault(&cfg.Codex.Binary, "codex")
+	setDefault(&cfg.Codex.ModelProvider, "openai")
+	// Verified against a ChatGPT subscription: the gpt-5.1-codex family is
+	// rejected for ChatGPT accounts, so a Codex-branded default would fail on
+	// the first turn.
+	setDefault(&cfg.Codex.Model, "gpt-5.6-terra")
+	if cfg.Codex.TurnTimeoutMs == 0 {
+		cfg.Codex.TurnTimeoutMs = 600000
+	}
+	if err := cfg.validateDeveloperTools(); err != nil {
+		return nil, err
+	}
+
+	// Quiet grace and turn-merge debounce. Both default to conservative values
+	// that measurably reduce the agent talking over a caller mid-thought.
+	if cfg.Pipeline.UserSpeechQuietMs == 0 {
+		cfg.Pipeline.UserSpeechQuietMs = 600
+	}
+	if cfg.Pipeline.TurnMergeMs == 0 {
+		cfg.Pipeline.TurnMergeMs = 350
+	}
+
+	// Echo-reference tuning. Only consulted for sessions the guard is on for.
+	setDefault(&cfg.Pipeline.EchoGuard, EchoGuardAuto)
+	if cfg.Pipeline.EchoGuardGain == 0 {
+		cfg.Pipeline.EchoGuardGain = 0.6
+	}
+	if cfg.Pipeline.EchoGuardMargin == 0 {
+		cfg.Pipeline.EchoGuardMargin = 1.8
+	}
+	if cfg.Pipeline.EchoGuardWindowMs == 0 {
+		cfg.Pipeline.EchoGuardWindowMs = 400
+	}
+
+	// Default barge-in to true if not explicitly set
+	if cfg.Pipeline.BargeIn == nil {
+		t := true
+		cfg.Pipeline.BargeIn = &t
+	}
+
+	// Realtime (speech-to-speech) defaults.
+	setDefault(&cfg.Grok.Model, "grok-voice-latest")
+	setDefault(&cfg.Grok.Voice, "eve")
+	setDefault(&cfg.Grok.ReasoningEffort, "high")
+	setDefault(&cfg.Grok.SystemPrompt, "You are a helpful AI voice assistant on a phone call. Keep responses short and conversational.")
+	if cfg.Grok.Transcription == nil {
+		t := true
+		cfg.Grok.Transcription = &t
+	}
+
+	if err := cfg.validateEchoGuard(); err != nil {
+		return nil, err
+	}
+
+	if err := cfg.validateRealtime(); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+// RealtimeEnabled reports whether the pipeline should run in speech-to-speech
+// mode, bypassing the STT, LLM, and TTS providers.
+func (c *Config) RealtimeEnabled() bool {
+	return c.Realtime.Provider != "" && c.Realtime.Provider != "none"
+}
+
+// validateDeveloperTools checks the GitHub and Codex sections up front, so a
+// missing key is a startup error rather than a puzzling tool failure mid-call.
+// Both integrations are optional and disabled by default.
+func (c *Config) validateDeveloperTools() error {
+	if c.GitHub.Enabled {
+		if strings.TrimSpace(c.GitHub.AppID) == "" {
+			return fmt.Errorf("[github] app_id is required when github.enabled is true")
+		}
+		if strings.TrimSpace(c.GitHub.InstallationID) == "" {
+			return fmt.Errorf("[github] installation_id is required when github.enabled is true")
+		}
+		if strings.TrimSpace(c.GitHub.PrivateKeyPath) == "" {
+			return fmt.Errorf("[github] private_key_path is required when github.enabled is true")
+		}
+		if len(c.GitHub.Repositories) == 0 {
+			return fmt.Errorf("[github] repositories must list at least one owner/name")
+		}
+		for _, repo := range c.GitHub.Repositories {
+			if strings.Count(repo, "/") != 1 || strings.HasPrefix(repo, "/") || strings.HasSuffix(repo, "/") {
+				return fmt.Errorf("[github] repository %q must be owner/name", repo)
+			}
+		}
+	}
+
+	if c.Codex.Enabled {
+		if strings.TrimSpace(c.Codex.WorkspaceRoot) == "" {
+			return fmt.Errorf("[codex] workspace_root is required when codex.enabled is true")
+		}
+		if c.Codex.TurnTimeoutMs < 0 {
+			return fmt.Errorf("[codex] turn_timeout_ms must not be negative")
+		}
+	}
+	return nil
+}
+
+// Echo-guard modes for pipeline.echo_guard.
+const (
+	EchoGuardAuto   = "auto"
+	EchoGuardAlways = "always"
+	EchoGuardOff    = "off"
+)
+
+// EchoGuardFor reports whether the barge-in echo bound applies to a peer,
+// given whether that peer declared it has no acoustic echo cancellation.
+func (c *Config) EchoGuardFor(aecAbsent bool) bool {
+	switch c.Pipeline.EchoGuard {
+	case EchoGuardAlways:
+		return true
+	case EchoGuardAuto:
+		return aecAbsent
+	default:
+		return false
+	}
+}
+
+func (c *Config) validateEchoGuard() error {
+	switch c.Pipeline.EchoGuard {
+	case EchoGuardAuto, EchoGuardAlways, EchoGuardOff:
+		return nil
+	default:
+		return fmt.Errorf("[pipeline] echo_guard = %q must be %q, %q, or %q",
+			c.Pipeline.EchoGuard, EchoGuardAuto, EchoGuardAlways, EchoGuardOff)
+	}
+}
+
+// validateRealtime rejects a bad speech-to-speech configuration at startup.
+// Without this a typo'd provider or a missing key only surfaces when the
+// first caller connects, which reads as a broken deployment rather than a
+// misconfigured one.
+func (c *Config) validateRealtime() error {
+	if !c.RealtimeEnabled() {
+		return nil
+	}
+
+	switch c.Realtime.Provider {
+	case "grok":
+		if c.Grok.APIKey == "" {
+			return fmt.Errorf("realtime.provider = %q requires [grok] api_key to be set", c.Realtime.Provider)
+		}
+	default:
+		return fmt.Errorf("unknown realtime provider %q (supported: grok)", c.Realtime.Provider)
+	}
+
+	if e := c.Grok.ReasoningEffort; e != "high" && e != "none" {
+		return fmt.Errorf("[grok] reasoning_effort = %q must be \"high\" or \"none\"", e)
+	}
+	// Out-of-range values are rejected by the provider mid-call, which is a
+	// far worse place to discover them.
+	if t := c.Grok.VADThreshold; t != 0 && (t < 0.1 || t > 0.9) {
+		return fmt.Errorf("[grok] vad_threshold = %v must be between 0.1 and 0.9", t)
+	}
+	if ms := c.Grok.SilenceDurationMs; ms < 0 || ms > 10000 {
+		return fmt.Errorf("[grok] silence_duration_ms = %d must be between 0 and 10000", ms)
+	}
+	if ms := c.Grok.PrefixPaddingMs; ms < 0 || ms > 10000 {
+		return fmt.Errorf("[grok] prefix_padding_ms = %d must be between 0 and 10000", ms)
+	}
+	if n := len(c.Grok.Keyterms); n > 100 {
+		return fmt.Errorf("[grok] keyterms has %d entries; the maximum is 100", n)
+	}
+
+	return nil
+}
+
+// applyEnvOverrides lets every secret be injected as an environment variable
+// instead of written into config.toml, which is what container and cloud
+// deployments need to keep keys out of images and files. A set variable wins
+// over the file value — the deployment environment is more authoritative than
+// a baked-in config — and each override is logged by name (never by value) so
+// a surprising key source is visible in the startup log.
+//
+// Provider keys use each provider's conventional variable name; secrets owned
+// by this server use a STREAMCORE_ prefix.
+var envOverrides = []struct {
+	env   string
+	field func(c *Config) *string
+}{
+	{"STREAMCORE_TURN_SECRET", func(c *Config) *string { return &c.Server.TurnSecret }},
+	{"STREAMCORE_JWT_SECRET", func(c *Config) *string { return &c.Server.JWTSecret }},
+	{"STREAMCORE_API_KEY", func(c *Config) *string { return &c.Server.APIKey }},
+	{"STREAMCORE_AGENT_API_KEY", func(c *Config) *string { return &c.Agent.APIKey }},
+	{"DEEPGRAM_API_KEY", func(c *Config) *string { return &c.Deepgram.APIKey }},
+	{"SARVAM_API_KEY", func(c *Config) *string { return &c.Sarvam.APIKey }},
+	{"ASSEMBLYAI_API_KEY", func(c *Config) *string { return &c.AssemblyAI.APIKey }},
+	{"GROQ_API_KEY", func(c *Config) *string { return &c.Groq.APIKey }},
+	{"ALIYUN_API_KEY", func(c *Config) *string { return &c.Aliyun.APIKey }},
+	{"VOLCENGINE_API_KEY", func(c *Config) *string { return &c.Volcengine.APIKey }},
+	{"OPENAI_API_KEY", func(c *Config) *string { return &c.OpenAI.APIKey }},
+	{"XAI_API_KEY", func(c *Config) *string { return &c.Grok.APIKey }},
+	{"CARTESIA_API_KEY", func(c *Config) *string { return &c.Cartesia.APIKey }},
+	{"ELEVENLABS_API_KEY", func(c *Config) *string { return &c.ElevenLabs.APIKey }},
+	{"SPEECHIFY_API_KEY", func(c *Config) *string { return &c.Speechify.APIKey }},
+	{"TELNYX_API_KEY", func(c *Config) *string { return &c.Telnyx.APIKey }},
+	{"MINIMAX_API_KEY", func(c *Config) *string { return &c.MiniMax.APIKey }},
+	{"MIMO_API_KEY", func(c *Config) *string { return &c.MiMo.APIKey }},
+	{"SUPABASE_API_KEY", func(c *Config) *string { return &c.Supabase.APIKey }},
+	{"PGVECTOR_CONNECTION_STRING", func(c *Config) *string { return &c.Pgvector.ConnectionString }},
+}
+
+func (c *Config) applyEnvOverrides() {
+	for _, o := range envOverrides {
+		if v := os.Getenv(o.env); v != "" {
+			*o.field(c) = v
+			log.Printf("config: %s set from environment", o.env)
+		}
+	}
+}
+
+func setDefault(field *string, fallback string) {
+	if *field == "" {
+		*field = fallback
+	}
+}

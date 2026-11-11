@@ -1,0 +1,50 @@
+Saylo
+Copyright 2026 SomehowLiving
+
+This product is a modified version of StreamCore
+(https://github.com/streamcoreai/streamcore-server), licensed under the
+Apache License, Version 2.0. The original copyright notices and license are
+retained; see LICENSE. "StreamCore" is a name of its authors; this
+distribution is not affiliated with or endorsed by them.
+
+Runtime changes (see the git history from commit dc3e568 on):
+- Listen first, greeting from the agent, ending the call after the last line.
+- Sarvam speech-to-text (REST and streaming); an AssemblyAI message-size fix.
+- Backchannels that don't cut the agent off; turn-taking in other languages.
+- Failover speech-to-text, and an adaptive listener that chooses and switches
+  speech-to-text per call by the caller's language (Groq Whisper and Sarvam
+  identification; audio replay across a switch).
+- Agent replies voiced sentence by sentence; [lang:xx] language tags.
+- Fixes to the bundled VibeVoice sidecars for a fully local setup.
+- Phone calls through Twilio Media Streams (internal/twilio/), on a media
+  interface that WebRTC calls now use too (internal/pipeline/media.go).
+- New: voice-router/ (Kokoro, Piper + Sarvam text-to-speech), configs/,
+  examples/quickstart/, tools/callers/, compose.yaml, docs/saylo/.
+
+Third-party components used at runtime, under their own licenses:
+- Kokoro-82M (Apache 2.0), https://huggingface.co/hexgrad/Kokoro-82M
+- piper-tts 1.2.0 and piper-phonemize 1.1.0 (MIT), https://github.com/rhasspy/piper
+- Piper voices, https://huggingface.co/rhasspy/piper-voices:
+  - Trained on CC0 datasets: de_DE-kerstin-low, de_DE-thorsten-high,
+    nl_BE-nathalie-medium, nl_BE-rdh-medium, ru_RU-dmitri-medium,
+    pl_PL-gosia-medium, pl_PL-darkman-medium, cs_CZ-jirka-medium,
+    hu_HU-berta-medium, hu_HU-imre-medium, sv_SE-nst-medium,
+    ro_RO-mihai-medium, fi_FI-harri-medium, da_DK-talesyntese-medium
+  - uk_UA-tetiana-high, uk_UA-mykyta-high (Apache 2.0), by Roman
+    Stasyshyn, on https://github.com/egorsmkv/ukrainian-tts-datasets
+  - cs_CZ-kasandra-medium (CC BY 4.0), voice and recordings by Ondřej
+    Šimek, https://huggingface.co/ondrazarici/Cassandra-Kasandra-piper-cz
+  - sv_SE-alma-medium (CC BY 4.0), https://huggingface.co/yeagersthlm/piper-voice-sv-alma,
+    trained on the NST Swedish TTS dataset (Språkbanken, National Library
+    of Norway)
+  - vi_VN-vais1000-medium (CC BY 4.0), trained on the VAIS-1000
+    Vietnamese speech synthesis corpus,
+    https://ieee-dataport.org/documents/vais-1000-vietnamese-speech-synthesis-corpus
+- StreamCore python-sdk (Apache 2.0), used by tools/callers/
+- Cloud APIs: Deepgram, Sarvam AI, AssemblyAI, Groq (their terms apply)
+
+Saylo modifications (2026):
+- Product branding and portfolio frontend messaging.
+- Full event-based transcript, bounded browser-local session history,
+  copyable extractive recaps, and a separate browser speech demonstration.
+- Original voice infrastructure and third-party notices retained above.

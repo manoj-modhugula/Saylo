@@ -1,0 +1,32 @@
+{
+  "es": {
+    "ACME": "Acme"
+  },
+  "fr": {
+    "ACME": "Acme"
+  },
+  "it": {
+    "ACME": "Acme"
+  },
+  "pt": {
+    "ACME": "Acme"
+  },
+  "ja": {
+    "ACME": "アクメ",
+    "Pro": "プロ",
+    "Starter": "スターター",
+    "Enterprise": "エンタープライズ"
+  },
+  "zh": {
+    "ACME": "艾克米",
+    "Pro": "专业版",
+    "Starter": "入门版",
+    "Enterprise": "企业版"
+  },
+  "hi": {
+    "ACME": "एक्मी",
+    "Pro": "प्रो",
+    "Starter": "स्टार्टर",
+    "Enterprise": "एंटरप्राइज़"
+  }
+}

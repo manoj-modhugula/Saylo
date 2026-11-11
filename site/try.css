@@ -1,0 +1,99 @@
+/* /try: the live demo page. Builds on styles.css tokens. */
+.try-hero { padding: 96px 0 40px; max-width: 860px; }
+.try-hero h1 { font-size: clamp(40px, 6vw, 72px); text-wrap: balance; }
+.try-hero .lede { margin: 22px 0 0; font-size: 18px; color: var(--ink-2); max-width: 680px; }
+
+.try-grid { display: grid; grid-template-columns: 1.25fr 1fr; gap: 20px; align-items: start; }
+.try-video, .try-call { padding: 26px; }
+.try-call h2 { font-size: 30px; margin-bottom: 14px; }
+
+.video-frame { position: relative; aspect-ratio: 16 / 9; border-radius: 14px; overflow: hidden; background: #0f141d; }
+.video-frame video, .video-frame iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; object-fit: contain; }
+.video-empty { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 10px; color: #9aa6bd; }
+.video-empty p { margin: 0; font-size: 14px; }
+.play { display: grid; place-items: center; width: 60px; height: 60px; border-radius: 50%; background: rgba(255, 255, 255, .08); color: #dfe6f3; font-size: 20px; padding-left: 4px; }
+
+.muted { margin: 0 0 14px; color: var(--ink-2); font-size: 15px; }
+.try-call .code { margin: 0 0 16px; }
+.field { display: grid; gap: 6px; margin-bottom: 8px; }
+.field[hidden] { display: none; } /* .field's display would otherwise beat the hidden attribute */
+.field .lbl { font-size: 13px; color: var(--ink-2); }
+.field input { font: 400 15px var(--mono); padding: 12px 14px; border-radius: 12px; border: 1px solid rgba(20, 30, 60, .14); background: #fff; color: var(--ink); }
+.field input:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.field select { font: 400 15px var(--font); padding: 12px 14px; border-radius: 12px; border: 1px solid rgba(20, 30, 60, .14); background: #fff; color: var(--ink); }
+.field select:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.hint { margin: 0 0 16px; font-size: 12.5px; color: var(--ink-3); }
+
+.call-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.call-row .btn:disabled { opacity: .45; cursor: not-allowed; }
+.status { display: flex; align-items: center; gap: 8px; margin: 16px 0 10px; font-size: 14px; color: var(--ink-2); }
+.status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+.status.live .dot, .status.listening .dot { background: #2fb36d; }
+.status.thinking .dot { background: #e0a43d; }
+.status.speaking .dot { background: var(--blue); }
+.meter { height: 4px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.meter span { display: block; height: 100%; width: 0; background: var(--blue); transition: width .08s linear; }
+
+.log { margin-top: 14px; display: grid; gap: 8px; align-content: start; min-height: 200px; } /* room for both bubbles: a new turn never resizes the card */
+.turn { padding: 10px 12px; border-radius: 12px; font-size: 14.5px; background: #fff; border: 1px solid var(--line); }
+.turn b { display: block; font-size: 11.5px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 2px; }
+.turn.you { background: rgba(61, 111, 224, .06); }
+.turn.partial { opacity: .65; }
+.log .note { font-size: 12.5px; color: var(--ink-3); }
+
+.try-tips { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; padding: 20px 0 100px; }
+.try-tips article { padding: 22px; }
+.try-tips h3 { font-size: 20px; margin-bottom: 6px; }
+.try-tips p { margin: 0; color: var(--ink-2); font-size: 15px; }
+
+@media (max-width: 900px) {
+  .try-grid, .try-tips { grid-template-columns: 1fr; }
+  .try-hero { padding-top: 64px; }
+}
+.field .lbl em { font-style: normal; color: var(--ink-3); }
+.turn.aside { margin-left: 22px; padding: 7px 11px; font-size: 13.5px; background: rgba(61, 111, 224, .04); border-style: dashed; }
+.video-tabs { margin-bottom: 14px; }
+.video-caption { margin: 12px 2px 0; font-size: 14px; color: var(--ink-2); }
+
+[hidden] { display: none !important; }
+.try-grid { grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr); }
+.try-grid > * { min-width: 0; }
+.try-video h2 { font-size: 32px; }
+.saylo-wave { height: 130px; display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--blue); }
+.saylo-wave i { display: block; width: 9px; height: 28px; background: currentColor; border-radius: 8px; animation: saylo-wave 2.4s ease-in-out infinite alternate; }
+.saylo-wave i:nth-child(2n) { height: 54px; animation-delay: -.7s; }
+.saylo-wave i:nth-child(3n) { height: 80px; animation-delay: -1.4s; }
+@keyframes saylo-wave { to { transform: scaleY(.55); opacity: .65; } }
+.panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.panel-heading h3 { font-size: 19px; line-height: 1.3; }
+.panel-heading .hint { margin: 0; }
+.transcript-heading, .history, #recap { margin-top: 28px; }
+.history { padding-top: 24px; border-top: 1px solid var(--line); }
+.history .hint { margin-top: 10px; }
+#historyList { list-style: none; padding: 0; margin: 16px 0 0; display: grid; gap: 8px; max-height: 340px; overflow-y: auto; }
+#historyList li { display: flex; align-items: center; gap: 8px; }
+.history-open { min-width: 0; flex: 1; text-align: left; border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: #fff; cursor: pointer; color: var(--ink); font: inherit; }
+.history-open strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 500; }
+.history-open time { display: block; color: var(--ink-2); font-size: 12px; }
+.text-button { padding: 9px 3px; background: none; border: 0; color: var(--blue); font: 500 13px var(--font); cursor: pointer; }
+.text-button:disabled, .history-open:disabled { opacity: .5; cursor: default; }
+.log { height: 330px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px; border-radius: 12px; }
+.turn { overflow-wrap: anywhere; white-space: pre-wrap; }
+.turn.you { margin-left: 25px; background: #edf2fc; }
+.turn.agent { margin-right: 25px; }
+.message-form { margin-top: 18px; }
+#summaryText { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); font-size: 14px; }
+.speak-option { display: flex; align-items: center; gap: 8px; margin: 16px 0; font-size: 14px; }
+@media (max-width: 900px) { .try-grid { grid-template-columns: minmax(0, 1fr); } .try-call { grid-row: 1; } }
+@media (max-width: 480px) { .try-video, .try-call { padding: 20px; } .log { height: 290px; } .try-hero { padding-top: 45px; } }
+
+.demo-settings { margin: 20px 0; }
+.demo-settings .hint { line-height: 1.6; }
+
+/* Conversation, history, and recap use the same card language. */
+.try-sidebar { display: grid; gap: 20px; min-width: 0; }
+.try-sidebar .history { margin-top: 0; padding: 26px; border-top: 1px solid var(--glass-line); }
+.try-call .btn { border-radius: 12px; }
+.try-call .log { background: rgba(255, 255, 255, .5); border: 1px solid var(--line); padding: 12px; }
+.try-call .conversation-recap { background: #fff; border: 1px solid var(--line); border-radius: var(--r); padding: 20px; }
+@media (max-width: 480px) { .try-sidebar .history { padding: 20px; } }

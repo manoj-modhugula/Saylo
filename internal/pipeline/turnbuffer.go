@@ -1,0 +1,215 @@
+package pipeline
+
+import (
+	"log"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+// Turn-buffer tuning. A caller who pauses mid-sentence ("I want to... um...
+// book a table") produces two finals from the STT provider. Answering the
+// first half is the single most common way a voice agent feels like it is
+// interrupting, so finals are held briefly and merged.
+const (
+	// turnMergeMax bounds how long a turn can be extended by repeated
+	// continuations, so a caller who never pauses cleanly still gets an answer.
+	turnMergeMax = 2500 * time.Millisecond
+	// turnMergeIncomplete is the longer wait used when the text ends on a
+	// dangling word ("and", "my number is", "Mi número de pedido es") or
+	// mid-dictation — the caller is clearly not finished. Long enough for a
+	// 1.5s pause: the final lands ~400ms after the caller stops, and the
+	// caller has to be audibly speaking again when it runs out (midSentenceMax).
+	turnMergeIncomplete = 1500 * time.Millisecond
+	// checkInWait is the wait after a turn that is only a check-in ("hello?",
+	// "haan hello"). Callers repeat it: live, a second "hello" landed 1.7s
+	// after the first final and was answered as a turn of its own. If the
+	// caller has made sound since the last final, the wait extends until the
+	// repeat's final arrives -- live, ~450ms after the sound stopped -- or
+	// they've been quiet for checkInFinalLag, bounded by turnMergeMax.
+	// midSentenceMax bounds the wait on a turn that ends mid-sentence ("Mi
+	// número de pedido es") while the caller is audibly speaking again: live,
+	// a 1.5s pause there got the first half answered.
+	midSentenceMax = 5 * time.Second
+
+	checkInWait     = 1200 * time.Millisecond
+	checkInFinalLag = 1000 * time.Millisecond
+	checkInPoll     = 100 * time.Millisecond
+)
+
+// mergeWait returns how long to hold a pending turn before answering it.
+//
+// Terminal punctuation wins over a dangling-looking tail word. The tail list
+// exists to hold open utterances with no closer ("I already fixed it" — the
+// caller is still going), but it also matches pronouns, so a sentence the
+// provider punctuated as finished ("I already fixed it.") was taking the long
+// incomplete window too. When the STT has already judged the thought complete,
+// believe it; only an unpunctuated dangling tail extends the wait.
+//
+// A sentence the provider punctuated as finished goes at once. Over 224 live
+// turns the base window merged a second piece into almost none of them while
+// delaying every reply by it; a piece that does follow is joined to the turn
+// anyway (continuesLastTurn), at the cost of a cancelled request.
+func mergeWait(text string, base time.Duration) time.Duration {
+	if endsTerminal(text) {
+		return 0
+	}
+	if endsIncomplete(text) || endsDictation(text) {
+		return turnMergeIncomplete
+	}
+	return base
+}
+
+// midSentence reports whether text stops where a sentence can't end. As in
+// mergeWait, terminal punctuation means the STT judged it finished.
+func midSentence(text string) bool {
+	return !endsTerminal(text) && (endsIncomplete(text) || endsDictation(text))
+}
+
+// callerSpokeSince reports whether the caller made sound after t, within
+// the last quiet: their next words are on their way through STT.
+func (p *Pipeline) callerSpokeSince(t time.Time, quiet time.Duration) bool {
+	n := p.lastCallerSoundAt.Load()
+	if n == 0 {
+		return false
+	}
+	sound := time.Unix(0, n)
+	return sound.After(t) && time.Since(sound) < quiet
+}
+
+// runTurnBuffer debounces final transcripts into whole turns. It waits a
+// short window after each final; a further final inside that window is merged
+// and the window restarts. The wait adapts to how the text ends:
+//
+//   - terminal punctuation ("...book a table.") — the caller sounds finished,
+//     so the configured (short) window applies
+//   - a dangling connective or dictation tail — extend, they are mid-thought
+//
+// While the window runs, retrieval is prefetched speculatively so the wait
+// costs nothing on turns that do need context.
+func (p *Pipeline) runTurnBuffer() {
+	base := time.Duration(p.cfg.Pipeline.TurnMergeMs) * time.Millisecond
+	if base <= 0 {
+		base = 350 * time.Millisecond
+	}
+
+	var (
+		pending    *TranscriptEvent
+		timer      *time.Timer
+		timerC     <-chan time.Time
+		turnBegan  time.Time
+		lastFinal  time.Time
+		prefetched bool
+	)
+	stop := func() {
+		if timer != nil {
+			timer.Stop()
+			timer, timerC = nil, nil
+		}
+	}
+	arm := func(d time.Duration) {
+		stop()
+		timer = time.NewTimer(d)
+		timerC = timer.C
+	}
+	flush := func() {
+		if pending == nil {
+			return
+		}
+		ev := *pending
+		pending, prefetched = nil, false
+		stop()
+		if !turnBegan.IsZero() {
+			ev.MergeWaitMs = time.Since(turnBegan).Milliseconds()
+		}
+		select {
+		case p.transcriptCh <- ev:
+		case <-p.ctx.Done():
+		}
+	}
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			stop()
+			return
+
+		case ev := <-p.finalCh:
+			text := strings.TrimSpace(ev.Text)
+			if text == "" {
+				continue
+			}
+			lastFinal = time.Now()
+			if pending == nil {
+				merged := ev
+				merged.Text = text
+				merged.langChars = utf8.RuneCountInString(text)
+				pending = &merged
+				turnBegan = time.Now()
+			} else {
+				pending.Text = strings.TrimSpace(pending.Text + " " + text)
+				// The longest piece speaks for the turn's language: a Hindi
+				// sentence ending in "okay, thank you" is still Hindi.
+				if n := utf8.RuneCountInString(text); ev.Language != "" && n > pending.langChars {
+					pending.Language, pending.langChars = ev.Language, n
+				}
+				// Keep the earliest turn start: latency is measured from when
+				// the caller first stopped speaking, not from the last chunk.
+				//
+				// The talking-over flag is sticky across the merge: a turn that
+				// began over the agent's voice was an interruption regardless of
+				// whether its later halves landed after the agent stopped.
+				pending.OverAgentSpeech = pending.OverAgentSpeech || ev.OverAgentSpeech
+				// The caller stopped at the end of the last piece.
+				if ev.SpeechEndAt.After(pending.SpeechEndAt) {
+					pending.SpeechEndAt = ev.SpeechEndAt
+				}
+				pending.CheckMs = max(pending.CheckMs, ev.CheckMs)
+				if ev.Provider != "" {
+					pending.Provider = ev.Provider
+				}
+			}
+
+			// A caller still mid-thought gets a longer grace period.
+			wait := mergeWait(pending.Text, base)
+			if isCheckIn(pending.Text) {
+				wait = checkInWait
+			}
+			if elapsed := time.Since(turnBegan); elapsed+wait > turnMergeMax {
+				if remaining := turnMergeMax - elapsed; remaining > 0 {
+					wait = remaining
+				} else {
+					flush()
+					continue
+				}
+			}
+
+			// Overlap retrieval with the wait rather than paying for it after.
+			if !prefetched && p.cfg.Pipeline.RAGPrefetch {
+				prefetched = true
+				p.startRAGPrefetch(pending.Text)
+			}
+			arm(wait)
+
+		case <-timerC:
+			// A check-in the caller is repeating: wait for the repeat's final.
+			if pending != nil && isCheckIn(pending.Text) && time.Since(turnBegan)+checkInPoll < turnMergeMax &&
+				p.callerSpokeSince(lastFinal, checkInFinalLag) {
+				arm(checkInPoll)
+				continue
+			}
+			// Mid-sentence, and the caller is talking again: the rest of the
+			// sentence is on its way through STT.
+			if pending != nil && midSentence(pending.Text) && time.Since(turnBegan)+checkInPoll < midSentenceMax &&
+				p.callerSpokeSince(lastFinal, checkInFinalLag) {
+				arm(checkInPoll)
+				continue
+			}
+			if pending != nil {
+				log.Printf("[turn-buffer] turn complete after %dms: %q",
+					time.Since(turnBegan).Milliseconds(), pending.Text)
+			}
+			flush()
+		}
+	}
+}

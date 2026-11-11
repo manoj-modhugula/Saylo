@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "name": "gmail-plugin",
+  "version": "0.1.0",
+  "dependencies": {
+    "@streamcore/plugin": "^0.2.0",
+    "googleapis": "^144.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0"
+  }
+}

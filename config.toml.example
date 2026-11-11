@@ -1,0 +1,365 @@
+# StreamCoreAI Server Configuration
+
+[server]
+port = "8080"
+public_ip = ""          # Public IP for ICE candidates when behind NAT (e.g., EC2). Leave empty for local/direct connections.
+turn_secret = ""        # Shared secret for the built-in STUN/TURN server. Required when public_ip is set.
+jwt_secret = ""         # Shared secret for JWT auth on /whip. Leave empty to disable auth.
+api_key = ""            # API key required to call POST /token. Leave empty to allow unauthenticated token generation.
+session_grace_ms = 30000 # How long a session with no connected peers is kept before it is reaped. The window lets a client recover a dropped connection (ICE restart or redial) without losing the conversation.
+max_sessions = 0        # Global cap on live sessions; past it POST /whip returns 503 with Retry-After. 0 = unlimited. Each session burns CPU and provider spend, so set this to what one instance can actually serve.
+
+[debug]
+bind = ""                      # pprof listener. Empty disables it; use 127.0.0.1:6060 and an SSH tunnel in production.
+allow_public = false            # Required acknowledgement when bind is not loopback. Public pprof endpoints expose process data and can consume CPU.
+block_profile_rate = 0          # Average nanoseconds blocked per sample; 1 records every event. 0 disables block profiling.
+mutex_profile_fraction = 0      # Sample 1 in this many mutex contention events; 1 records every event. 0 disables mutex profiling.
+
+[reports]
+enabled = true                  # One JSON line per reply and per call, read by `saylo report`. Numbers and labels only: never audio or what was said.
+dir = "reports"                 # Where the daily files go (calls-YYYY-MM-DD.jsonl).
+
+[plugins]
+directory = "./plugins"     # Required if you want plugins and skills loaded
+# config = {}               # Per-plugin settings, keyed by the name in the plugin's manifest
+
+# Each plugin's own settings are handed to it at startup. They belong here
+# rather than in a dotenv next to the plugin's source, so one file holds the
+# whole deployment's configuration. Quote a name that contains a dot:
+# [plugins.config."weather.get"].
+#
+# [plugins.config.github]
+# app_id = "123456"
+# installation_id = "78901234"
+
+# Claude Code and Codex rate-limit meter, spoken and pushed to the client as a
+# display.card. Off by default: it reads files that only exist on a machine
+# where those tools actually run. See plugins/plugins/ai-usage/README.md.
+#
+# [plugins.config."ai.usage"]
+# enabled = true
+# claude_snapshot_dir = "~/.claude/plugins/claude-hud/eink-snapshots"
+# codex_sessions_dir  = "~/.codex/sessions"
+# stale_after_minutes = 30
+
+# Persistent display projection over the existing events DataChannel.
+# Disabled by default; existing deployments send no new events unless enabled.
+[display]
+enabled = false
+plugin = "display-projector"
+
+[display.projector]
+timeout_ms = 3000          # Maximum time for one post-response model projection
+fast_path_max_chars = 80   # Larger simple answers use this threshold before a model call
+
+# Developer agent — GitHub App plus the Codex harness. Both are disabled by
+# default; with them off the server behaves exactly as it did before.
+#
+# GitHub authenticates as a GitHub App: the private key below is exchanged for
+# short-lived installation tokens, scoped per repository and per operation. No
+# personal access token is involved. The key stays server-side and never reaches
+# the model, a tool result, the DataChannel, or a log line.
+[github]
+enabled = false
+app_id = ""                 # App ID or client ID from the app's settings page. Used as the JWT `iss`; GitHub recommends the client ID.
+installation_id = ""        # From the installation URL, or GET /repos/{owner}/{repo}/installation
+private_key_path = ""       # PEM downloaded when the app was created, e.g. /run/secrets/streamcore-github-app.pem
+repositories = []           # Allowlist, as owner/name. A repository must be listed here AND reachable by the installation.
+api_base_url = ""           # Override for GitHub Enterprise Server, e.g. https://ghe.example.com/api/v3
+
+# Codex authenticates with the operator's ChatGPT subscription, through the
+# official "Sign in with ChatGPT" flow. Run `codex login` once as the same OS
+# user that runs StreamCore; Codex owns that credential state from then on.
+#
+# There is deliberately no api_key here. OPENAI_API_KEY is not required and is
+# never used as a fallback: an API-key account is reported as unauthenticated.
+[codex]
+enabled = false
+binary = "codex"                            # Codex CLI to launch as an app-server. Tested against 0.144.1.
+model_provider = "openai"                   # Pinned on the command line so a third-party default in ~/.codex/config.toml cannot silently take over
+model = "gpt-5.6-terra"                     # Must be a model your ChatGPT plan allows; the gpt-5.1-codex family is not one of them
+workspace_root = "/var/lib/streamcore/codex" # Isolated worktrees live here. Codex can write here and nowhere else.
+turn_timeout_ms = 600000                    # One Codex turn before it is interrupted
+network_access = false                      # Open the task sandbox to the network. Only needed when the repo's tests fetch dependencies.
+config = []                                 # Extra `-c key=value` overrides passed to the app-server
+
+[pipeline]
+barge_in = true
+greeting = ""           # Spoken when a session connects
+greeting_outgoing = ""  # Spoken for outbound SIP calls; falls back to greeting
+debug = false           # Emit timing events over the DataChannel and log a per-turn latency breakdown
+user_speech_quiet_ms = 600   # Quiet period after the caller stops before the agent speaks
+turn_merge_ms = 350          # Wait for more of the sentence after a final that doesn't end in . ! ? -- a
+                             # punctuated one is answered at once (a late second piece is still joined)
+# rag_prefetch = false                    # Start retrieval during the merge window instead of after it
+# readback_bargein_guard_enabled = false  # Ignore weak barge-ins while the agent reads values back
+# greeting_delay_ms = 4000                # Hold the greeting this long to let the caller speak first;
+                                           # skipped entirely if they do. 0 (default) greets immediately.
+                                           # Not wired into realtime/speech-to-speech mode.
+# greeting_speech_settle_ms = 5000        # If the caller made sound during that hold, keep waiting this long
+                                           # after they go quiet for their words to come back from STT before
+                                           # greeting anyway. Must exceed your STT's end-of-speech-to-final
+                                           # latency; raise it for batch or CPU-bound local STT.
+# greeting_from_agent = false            # Ask llm.provider = "agent" for the opening line (a "greeting"
+                                           # request) instead of speaking the static greeting; the static
+                                           # greeting becomes the fallback if the agent fails.
+
+# Echo reference for barge-in, decided per session. On a path with no AEC
+# (SIP/PCMU telephony) the agent's own voice comes back loud enough to look
+# like an interruption; a browser cancels it in getUserMedia and needs no
+# bound. "auto" follows what each client declares on the WHIP URL (aec=none),
+# which sip-server already sends, so one server can host both.
+# echo_guard = "auto"           # auto | always | off. "always" is for raw-path clients that send no hint
+# echo_guard_gain = 0.6         # Echo cannot exceed this fraction of what produced it
+# echo_guard_margin = 1.8       # How far inbound must clear the echo bound to count as the caller
+# echo_guard_window_ms = 400    # How long sent audio stays in the reference window
+
+# Provider selection
+
+# Speech-to-speech mode. Setting a provider here replaces [stt], [llm], and
+# [tts] with a single model that hears audio and answers with audio — it also
+# takes over turn detection and barge-in. Leave empty for the classic
+# STT -> LLM -> TTS pipeline.
+[realtime]
+provider = ""           # Supported: grok (empty = classic pipeline)
+
+[stt]
+provider = "deepgram"   # Supported: adaptive, aliyun, assemblyai, deepgram, failover, openai, sarvam, telnyx, vibevoice, volcengine
+failover = []           # With provider = "failover": providers in order, e.g. ["sarvam", "deepgram"] -- the first that
+                        # connects serves the call; if it fails mid-call the next takes over
+
+# With provider = "adaptive": the listener is chosen per call (from the agent's "listen" hint) and switched
+# mid-call when a turn it may have misheard turns out to be in a language another listener hears better.
+# Each listener is a failover chain. Deepgram multi hears en/hi/es/fr/de/it/pt/nl/ru/ja; regional Indian
+# languages go to the Indian chain; zh/ko/ar/tr to Deepgram with the language fixed.
+[stt.adaptive]
+world = ["deepgram", "assemblyai", "sarvam"]  # default listener
+indian = ["sarvam", "deepgram"]               # after a turn is identified as Tamil, Telugu, Bengali...
+identify = ["groq", "sarvam"]                 # who identifies a checked turn's language (Groq Whisper, then Sarvam)
+identify_model = "whisper-large-v3"           # Groq model; the turbo model mislabels Indian languages
+hindi_confidence = 0.97                       # a Deepgram "hi" turn below this is checked
+min_confidence = 0.85                         # any Deepgram turn below this is checked
+
+[llm]
+provider = "openai"     # Supported: openai, ollama, agent
+
+[tts]
+provider = "cartesia"   # Supported: aliyun, cartesia, deepgram, elevenlabs, failover, mimo, minimax, speechify, telnyx, vibevoice, volcengine
+failover = []           # With provider = "failover": voices in order of preference, e.g. ["vibevoice", "cartesia"]. Each
+                        # sentence goes to the first available one; a voice that errors, is rate limited or out of
+                        # credit, or doesn't start speaking in time is skipped and the sentence goes to the next
+languages = {}          # Per-language order, overriding failover for that language: { hi = ["cartesia", "vibevoice"] }
+first_audio_timeout_ms = 3000  # No audio within this and the sentence goes to the next voice
+cooldown_ms = 30000     # How long a failed voice is skipped (out of credit: 10 min; key rejected: until restart)
+client_choice = false   # Let a call pick one of the configured voices (?voice=name on /whip; GET /voices lists them).
+                        # Off by default: a caller could otherwise choose the most expensive one
+
+# Provider credentials
+
+# xAI Grok speech-to-speech. Used when realtime.provider = "grok".
+[grok]
+api_key = ""                            # Required. Your xAI API key
+model = "grok-voice-latest"             # Tracks the newest model. Pin a version in production,
+                                        # e.g. "grok-voice-think-fast-2.0"
+voice = "eve"                           # Built-in voice ID, or a custom voice ID
+reasoning_effort = "high"               # "high" for nuance and multi-step instructions; "none" for lower latency
+system_prompt = "You are a helpful AI voice assistant on a phone call. Keep responses short and conversational."
+                                        # Keep this short. These models are strong enough that porting a long
+                                        # GPT-era prompt over verbatim makes them worse, not better
+
+# Server-side turn detection. Unset values use xAI's defaults.
+# vad_threshold = 0.85          # 0.1-0.9. Higher demands louder audio to trigger a turn
+# silence_duration_ms = 500     # Silence before the caller's turn ends. Raise if callers get cut off mid-sentence
+# prefix_padding_ms = 333       # Audio kept from before speech onset, so first words are not clipped
+# idle_timeout_ms = 0           # Agent re-engages after this much silence. 0 disables the check-in
+
+# Transcription of the caller's audio, for the client-side transcript only —
+# the model hears the audio directly and does not need it. Costs an extra pass.
+transcription = true
+# language_hint = ""            # BCP-47 tag. Spanish/Portuguese need a region ("es-MX", "pt-BR")
+# keyterms = []                 # Bias transcription toward domain words. Up to 100 terms
+
+# xAI-hosted tools, executed server-side with no local plugin needed.
+# web_search = false
+# x_search = false
+
+[deepgram]
+api_key = ""            # Required for Deepgram STT, and for Deepgram TTS if selected
+model = "nova-3"        # STT model
+tts_model = "aura-2-thalia-en"  # Aura voice used when tts.provider = "deepgram".
+                        # e.g. aura-2-theia-en (Australian, feminine), aura-2-pandora-en (British, feminine).
+                        # Full list: https://developers.deepgram.com/docs/tts-models
+language = ""           # Optional BCP-47 tag (en-US, es-MX). Non-en/es routes to the multilingual model
+endpointing = "300"     # Silence (ms) before a transcript is finalised. Raise it if callers get cut off mid-sentence
+utterance_end_ms = "1000"  # Silence (ms) before an UtteranceEnd event; flushes a turn when no speech_final arrives (min 1000)
+keyterms = []           # Nova-3 only: bias the decoder toward domain words ("Tauranga", product names)
+
+# Sarvam AI (https://docs.sarvam.ai) speech-to-text. REST/batch only -- no
+# streaming endpoint -- so this provider emits finals only: barge-in falls
+# back to VAD-only after the backchannel window (see internal/stt/sarvam.go).
+[sarvam]
+api_key = ""             # Required if stt.provider = "sarvam" (or SARVAM_API_KEY)
+mode = "stream"          # "stream" (WebSocket, default) or "rest" (one upload per utterance)
+stream_model = "saarika:v2.5"  # Streaming model
+model = "saaras:v3"      # REST model: "saaras:v3" or "saaras:v4"
+language_code = "unknown" # BCP-47 (e.g. "hi-IN", "en-IN"), or "unknown" to auto-detect
+
+[groq]
+api_key = ""            # Groq Whisper identifies languages for stt.provider = "adaptive" (or set GROQ_API_KEY)
+
+[assemblyai]
+api_key = ""            # Required if stt.provider = "assemblyai"
+model = "u3-rt-pro"     # Universal-Streaming model; "u3-rt" is the cheaper baseline
+language = ""           # Optional BCP-47 tag; region is stripped (en-NZ -> en). Empty auto-detects
+# format_turns = true   # Auto-punctuate and capitalise the final turn
+# end_of_turn_silence_ms = 0   # Override how long the model waits before ending a turn
+keyterms = []           # Bias the decoder toward domain words
+
+[openai]
+api_key = ""            # Required for LLM, and for OpenAI STT if selected
+model = "gpt-4o-mini"
+stt_model = "whisper-1" # STT model: whisper-1, gpt-4o-transcribe, or gpt-4o-mini-transcribe
+system_prompt = "You are a helpful AI voice assistant. Keep your responses concise and conversational."
+base_url = ""           # Optional. Any endpoint speaking OpenAI's protocol — DeepSeek
+                         # (https://api.deepseek.com/v1, model deepseek-chat), Moonshot
+                         # (https://api.moonshot.cn/v1), Qwen, MiniMax, Telnyx
+                         # (https://api.telnyx.com/v2/ai, e.g. model glm-5.3). Empty targets OpenAI.
+                         # Prefer a non-reasoning model here: reasoning models emit their
+                         # thinking before the answer, and on a voice call that is dead air.
+                         # Note this is unrelated to [ollama] base_url, which speaks Ollama's
+                         # own protocol — the two are not interchangeable
+
+[ollama]
+base_url = "http://localhost:11434"  # Ollama server URL
+model = "gemma4:e4b"                   # Model name (e.g., gemma4:e4b, mistral, qwen2.5)
+system_prompt = "You are a helpful AI voice assistant. Keep your responses concise and conversational."
+
+# Bring your own agent — used when llm.provider = "agent". Each user turn is
+# POSTed as JSON {session_id, type, text, system} to this URL; the endpoint
+# owns the conversation (memory, prompting, tools) and replies with text as
+# SSE ("data:" lines, raw or {"delta": "..."}), chunked text/plain, or a
+# buffered application/json {"text": "..."}. Streaming replies are spoken
+# sentence-by-sentence as they arrive.
+[agent]
+url = ""                # e.g. http://localhost:9000/agent
+api_key = ""            # Sent as Authorization: Bearer. Empty disables auth.
+timeout_ms = 60000      # Whole-turn budget, including streaming the reply
+
+[cartesia]
+api_key = ""            # Required if tts.provider = "cartesia"
+model = ""              # Optional; defaults to sonic-3.6. Pin a snapshot ("sonic-3.6-2026-08-27") to keep the voice from changing
+voice_id = ""           # Optional; speaks languages without a voice of their own. Defaults to Katie (American English)
+# A voice speaks other languages in its own accent, so each Indian language
+# defaults to a voice native in it (internal/tts/cartesia_voices.go). Override
+# per language, and the locale (accent, and how numbers and dates are read):
+# voices = { hi = "<voice id>", ta = "<voice id>" }
+# locales = { en = "en-IN" }   # Indian languages default to "xx-IN"
+ws_url = ""             # Optional; defaults to wss://api.cartesia.ai/tts/websocket
+max_concurrency = 3     # Simultaneous generations before requests queue locally instead of hitting 429s.
+                        # Set to your plan's TTS concurrency limit; negative disables the limiter
+
+[elevenlabs]
+api_key = ""            # Required if tts.provider = "elevenlabs"
+voice_id = ""           # Optional; defaults to ElevenLabs Rachel
+model = ""              # Optional; defaults to eleven_turbo_v2_5
+
+[speechify]
+api_key = ""            # Required if tts.provider = "speechify"
+voice_id = ""           # Optional; defaults to Geffen (geffen_32). Simba 3.2 uses its curated voice set.
+model = ""              # Optional; defaults to simba-3.2
+
+[telnyx]
+api_key = ""            # Required if tts.provider = "telnyx" or stt.provider = "telnyx"
+voice = "Telnyx.Qwen3TTS.d9348e0d-988a-42cc-a64e-18093fe45c03"  # Any catalog voice from GET /v2/text-to-speech/voices
+                          # (Qwen3TTS voices use UUID ids). Availability varies by account; a voice your
+                          # key is not provisioned for fails the dial with HTTP 403
+voice_speed = 1.0       # Playback-rate multiplier, clamped to 0.8-1.2 like the per-utterance delivery tags
+transcription_engine = "Deepgram"  # STT. Transcription engine when stt.provider = "telnyx".
+                          # Verified values: "Deepgram" (streams partials, so barge-in and live captions
+                          # work) or "Telnyx" (in-house, finals-only: live captions show finals only and
+                          # barge-in waits out the backchannel window on VAD alone; a startup log line
+                          # says so). Case-sensitive, sent verbatim; other hosted engines pass through untested
+
+[mimo]
+api_key = ""            # Required if tts.provider = "mimo"
+voice = ""              # Optional; defaults to mimo_default. Chinese: 茉莉 冰糖 苏打 白桦; English: Mia Chloe Milo Dean
+model = ""              # Optional; defaults to mimo-v2.5-tts. Also mimo-v2.5-tts-voiceclone / -voicedesign (paid)
+# base_url = ""         # Optional; defaults to https://api.xiaomimimo.com/v1
+
+[minimax]
+api_key = ""            # Required if tts.provider = "minimax"
+voice_id = ""           # Optional; defaults to English_Graceful_Lady. Chinese (Mandarin)_News_Anchor and 40+ languages available
+model = ""              # Optional; defaults to speech-2.6-turbo (low latency). A Token Plan key (sk-cp-) covers only
+                        # speech-2.8-hd — any other model routes to pay-as-you-go and fails with 2056 on a zero balance
+# base_url = ""         # Optional; defaults to https://api.minimax.io/v1. Accounts registered on the mainland-China
+                        # platform use https://api.minimaxi.com/v1 — keys are not interchangeable between the two
+
+# VibeVoice — local STT and TTS via external Python services.
+# Start the servers first:
+#   python external/vibeVoice/vibeVoiceAsr/server.py   (default port 8200)
+#   python external/vibeVoice/vibeVoiceTTS/server.py   (default port 8300)
+[vibevoice]
+asr_url = "ws://127.0.0.1:8200"    # WebSocket URL for VibeVoice ASR server
+tts_url = "http://127.0.0.1:8300"  # HTTP URL for VibeVoice TTS server
+voice = "en-Emma_woman"             # TTS voice name
+
+# Alibaba Cloud Model Studio (DashScope). One endpoint and one key serve both
+# streaming ASR (stt.provider = "aliyun") and streaming TTS
+# (tts.provider = "aliyun"). Get an API key at https://bailian.console.aliyun.com/
+[aliyun]
+api_key = ""            # Required
+model = ""              # STT. Optional; defaults to paraformer-realtime-v2.
+                        # fun-asr-realtime is the alternative
+language = ""           # STT. Optional hint for a multilingual model ("zh", "en"). Empty auto-detects
+vocabulary_id = ""      # STT. Optional; a hotword list created in the console, for domain
+                        # terms the model keeps getting wrong
+tts_model = ""          # TTS. Optional; defaults to cosyvoice-v2
+voice = ""              # TTS. Optional; defaults to longxiaochun_v2. Voices are tied to a
+                        # model generation — a v1 voice on cosyvoice-v2 is rejected, so
+                        # change tts_model and voice together
+url = ""                # Optional; defaults to wss://dashscope.aliyuncs.com/api-ws/v1/inference
+
+# Volcengine (Doubao). One console API key serves both streaming ASR
+# (stt.provider = "volcengine") and streaming TTS (tts.provider = "volcengine").
+# Useful where Deepgram is slow to reach or its Mandarin is not good enough;
+# the console gives a free hourly allowance to start with.
+[volcengine]
+api_key = ""            # Required. The console's API key, sent as X-Api-Key.
+                        # The older app-id + access-token pair is rejected here
+resource_id = ""        # Optional; defaults to volc.seedasr.sauc.duration (hourly plan).
+                        # volc.seedasr.sauc.concurrent bills by concurrency instead
+model = ""              # Optional; defaults to bigmodel
+url = ""                # Optional; defaults to wss://openspeech.bytedance.com/api/v3/sauc/bigmodel
+end_window_ms = 0       # STT. Optional; silence (ms) that settles an utterance, defaults to 800.
+                        # Same role as [deepgram] endpointing
+tts_resource_id = ""    # TTS. Optional; defaults to seed-tts-2.0. The 1.0 resource
+                        # (volc.service_type.10029) is a separate entitlement and answers 403
+                        # until it is activated
+speaker = ""            # TTS. Optional; defaults to zh_female_vv_uranus_bigtts. Voices belong to a
+                        # model generation — the 2.0 resource takes the `_uranus_bigtts` voices and
+                        # refuses the older `_moon_` / `_mars_` / `_jupiter_` ones, so change
+                        # speaker and tts_resource_id together
+tts_url = ""            # Optional; defaults to wss://openspeech.bytedance.com/api/v3/tts/bidirection
+
+# Vision (used by the vision-analyze plugin)
+# The plugin reads OPENAI_API_KEY from the environment (same key as [openai]).
+# Set VISION_MODEL env var to override the model (default: gpt-4o).
+
+[rag]
+provider = "supabase"   # or "pgvector", or omit entirely to disable
+top_k = 3
+embedding_model = "text-embedding-3-small"  # optional, this is the default
+# The model fixes the column width: text-embedding-3-small and -ada-002 need
+# vector(1536), text-embedding-3-large needs vector(3072). The server checks
+# this against the store at startup and refuses to boot on a mismatch.
+
+[supabase]
+url = "https://xxx.supabase.co"
+api_key = "your-service-role-key"
+function = "match_documents"   # optional, this is the default
+table = "documents"            # optional; used by streamcore-cli when ingesting
+
+# Use this instead of [supabase] when rag.provider = "pgvector".
+# [pgvector]
+# connection_string = "postgres://user:pass@localhost:5432/mydb"
+# table = "documents"          # optional, this is the default

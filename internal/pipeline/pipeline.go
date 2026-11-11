@@ -1,0 +1,540 @@
+package pipeline
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/pion/webrtc/v4"
+	"github.com/streamcoreai/streamcore-server/internal/callreport"
+	"github.com/streamcoreai/streamcore-server/internal/config"
+	"github.com/streamcoreai/streamcore-server/internal/llm"
+	"github.com/streamcoreai/streamcore-server/internal/plugin"
+	"github.com/streamcoreai/streamcore-server/internal/rag"
+	"github.com/streamcoreai/streamcore-server/internal/realtime"
+	"github.com/streamcoreai/streamcore-server/internal/tts"
+	"github.com/streamcoreai/streamcore-server/internal/vad"
+)
+
+const (
+	inPCMChSize      = 50 // ~1s of 20ms frames
+	transcriptChSize = 10
+	outPCMChSize     = 100 // ~2s of 20ms frames
+)
+
+// Pipeline is a channel-based streaming media pipeline.
+//
+// Goroutine architecture:
+//
+//	runReader   — RTP read → Opus decode → inPCMCh
+//	runInbound  — inPCMCh → STT feed + VAD barge-in detection
+//	runAgent    — transcriptCh → LLM → TTS → outPCMCh
+//	runSender   — outPCMCh → Opus encode → RTP write
+type Pipeline struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	cfg    *config.Config
+
+	// The caller's audio link: a WebRTC peer's tracks, or a phone stream.
+	media Media
+
+	// Providers. In realtime mode llmClient and ttsClient are nil — the
+	// speech-to-speech provider covers all three roles.
+	llmClient llm.Client
+	ttsClient tts.Client
+	ragClient rag.Client
+
+	// Realtime (speech-to-speech) mode
+	realtimeMu     sync.Mutex
+	realtimeClient realtime.Client
+	// realtimeReady closes once the provider connection is up, so the
+	// greeting can wait for it instead of racing the dial.
+	realtimeReady chan struct{}
+	// realtimeAudio buffers agent audio between the provider's read
+	// goroutine and the paced outbound sender.
+	realtimeAudio *realtimeAudioQueue
+	// realtimeTurn merges the transcription fragments a provider emits for
+	// one spoken turn, so the client renders a single message.
+	realtimeTurn realtimeUserTurn
+	// realtime lifecycle state. The provider owns response cancellation; these
+	// only snapshot settled text without changing realtime audio handling.
+	realtimeUserText    atomic.Value // string — final user turn for display events
+	realtimeCurrentGen  atomic.Uint64
+	realtimeInterrupted atomic.Bool
+
+	// Plugins
+	pluginMgr *plugin.Manager
+
+	// reflex fires manifest-declared tools from a partial transcript, ahead of
+	// the model. nil when no loaded manifest asked for it, which is the case
+	// for every deployment without a robot on the other end.
+	reflex *partialReflex
+
+	// reflexSent records packets the reflex already sent, so the model's own
+	// call to the same tool a moment later does not send a duplicate the
+	// device would treat as a second command.
+	reflexSentMu sync.Mutex
+	reflexSent   map[string]time.Time
+
+	// VAD
+	vad        *vad.Detector
+	bargeInVAD *vad.Detector
+	// echoGuard feeds the barge-in VAD the RMS of what the sender just put
+	// on the wire, so returning agent audio on a path with no AEC does not
+	// read as the caller interrupting. Nil unless pipeline.echo_guard is on.
+	echoGuard *vad.EchoGuard
+
+	// Bounded channels
+	inPCMCh chan PCMFrame
+	// finalCh carries raw STT finals to the turn buffer, which merges them
+	// into whole turns before they reach transcriptCh.
+	finalCh      chan TranscriptEvent
+	transcriptCh chan TranscriptEvent
+	outPCMCh     chan PCMFrame
+	interruptCh  chan struct{}
+
+	// DataChannel messaging
+	sendEvent func(interface{}) error
+
+	// One-shot model for plugins that ask the server for a completion. Built
+	// on demand because realtime mode has no conversation client to borrow.
+	oneShotOnce sync.Once
+	oneShotLLM  llm.Client
+	oneShotErr  error
+
+	// Agent state
+	speaking atomic.Bool
+	// speechEndedAt is the wall-clock nanosecond at which speaking last went
+	// true → false, always written via setSpeaking. STT endpointing delays a
+	// final by several hundred ms, so an acknowledgement spoken over the
+	// agent's closing words routinely arrives after the flag has cleared;
+	// agentSpeechRecent uses this to still classify it as talking-over.
+	speechEndedAt atomic.Int64
+
+	// --- Turn quality state (rolling summary, misunderstanding, RAG prefetch) ---
+
+	// conv is the durable half of the call — LLM history, transcript log,
+	// rolling summary — owned by the Session rather than by this Pipeline, so
+	// it survives a dropped connection and a resume onto new tracks.
+	conv *ConversationState
+
+	// suppressGreeting is set when this Pipeline took over a conversation
+	// already in progress.
+	suppressGreeting bool
+
+	// callerSpokeFirst is closed the moment the caller's first real turn
+	// (not a passive acknowledgement) reaches runAgent, so a delayed
+	// greeting (see cfg.Pipeline.GreetingDelayMs) can cancel itself instead
+	// of talking over whatever the caller just said. closeCallerSpokeFirst
+	// guards the close so it only ever happens once.
+	callerSpokeFirst      chan struct{}
+	closeCallerSpokeFirst sync.Once
+
+	// lastCallerSoundAt (unix nanos, 0 = never) is when runInbound's onset
+	// VAD last heard the caller while the agent wasn't speaking. It lets a
+	// delayed greeting hold off while the caller's first words are still in
+	// flight through STT, and holds a check-in turn ("hello?") while the
+	// caller is saying it again.
+	lastCallerSoundAt atomic.Int64
+	// lastPartialAt (unix nanos, 0 = none since the last final) is when the
+	// listener last sent partial words: the caller is mid-utterance.
+	lastPartialAt   atomic.Int64
+	greetingDecided atomic.Bool
+
+	// transcriptLog is the running record of the conversation. The rolling
+	// summary and the low-confidence heuristics read it; it is not the
+	// LLM's own history. Shared with conv.
+	transcriptLog *TranscriptLog
+
+	// rollingSummary holds the most recent background-generated digest of
+	// older turns, so long calls keep their early context after the LLM
+	// history window has dropped it. Held by pointer because it belongs to
+	// the ConversationState, which outlives this Pipeline across a resume.
+	rollingSummary       *atomic.Value // string
+	lastSummaryAtEntries *atomic.Int32
+	summaryGenerating    atomic.Bool
+
+	// misunderstandingStreak counts consecutive low-confidence caller turns,
+	// driving an escalating "could you repeat that" rather than a guess.
+	misunderstandingStreak atomic.Int32
+	// userConfidence is the STT confidence of the most recent final turn.
+	userConfidence atomic.Value // float64
+
+	// ragDisabled short-circuits retrieval for the rest of the call after a
+	// hard failure, so every turn does not re-pay the timeout.
+	ragDisabled atomic.Bool
+	// ragPrefetch holds a speculative retrieval started during the turn-merge
+	// window, so embedding and vector search overlap the debounce.
+	ragPrefetchMu sync.Mutex
+	ragPrefetch   *ragPrefetchState
+
+	// duckChangeCh signals the outbound sender to attenuate or restore agent
+	// audio while the caller is talking over it.
+	duckChangeCh chan bool
+	audioMuted   atomic.Bool
+	processing   atomic.Bool
+
+	// responseGen identifies the response that currently owns the audio path.
+	// It is bumped every time a response is superseded (new turn or barge-in),
+	// so a cancelled response unwinding late can tell that speaking,
+	// responseCancel, and the client-facing state now belong to its successor
+	// and must not be cleared. Without this, a late unwind strands the live
+	// response with no cancel func and it talks over the next one.
+	responseGen       atomic.Uint64
+	responseMu        sync.Mutex
+	responseCancel    context.CancelFunc
+	responseCancelGen uint64
+
+	// endCallGen is gen+1 of the response whose backend asked to end the call
+	// (llm.CallEnder); 0 means none. finishResponse ends the pipeline once
+	// exactly that response has fully played. Offset by one so the zero value
+	// can never match the greeting's generation.
+	endCallGen atomic.Uint64
+
+	// Interruption tracking
+	lastAgentText   atomic.Value // string — accumulates current response text
+	interruptedText atomic.Value // string — what the caller heard of a reply they cut off
+	// turnLanguage is the language of the caller's last full sentence.
+	turnLanguage atomic.Value // string
+	// callLang is the language the conversation is in (see callLanguage).
+	callLang callLanguage
+	// ledger records which sentences of the current response actually played.
+	ledger playbackLedger
+	// lastTurn is the caller's last turn as answered; owned by runAgent.
+	lastTurn answeredTurn
+	// clocks times each turn's reply: response gen → *turnClock.
+	clocks sync.Map
+	// report records the call for `saylo report` (nil when reports are off);
+	// endedBy is who ended it, when that's known: "agent" or "error".
+	report  *callreport.Call
+	endedBy atomic.Value // string
+	// lifecycleEmittedGen guarantees one completion event per response
+	// generation; latestLifecycleTurn rejects late plugin output from an older
+	// turn when a newer turn has already completed.
+	lifecycleEmittedGen atomic.Uint64
+	latestLifecycleTurn atomic.Uint64
+
+	// Vision
+	imageRecv *imageReceiver
+
+	// Call metadata
+	direction string // "outbound" for outgoing SIP calls, empty otherwise
+
+	// Outbound talkspurt marker: set for the first frame of an utterance.
+	rtpMu      sync.Mutex
+	markerNext bool
+}
+
+// New creates a pipeline wired to the given WebRTC tracks.
+// Call Start() to launch the goroutine chain.
+func New(
+	ctx context.Context,
+	cfg *config.Config,
+	remoteTrack *webrtc.TrackRemote,
+	localTrack *webrtc.TrackLocalStaticRTP,
+	sendEvent func(interface{}) error,
+	pluginMgr *plugin.Manager,
+	ragClient rag.Client,
+	opts PeerOptions,
+	conv *ConversationState,
+	resumed bool,
+) (*Pipeline, error) {
+	media, err := newWebRTCMedia(remoteTrack, localTrack)
+	if err != nil {
+		return nil, err
+	}
+	return NewWithMedia(ctx, cfg, media, sendEvent, pluginMgr, ragClient, opts, conv, resumed)
+}
+
+// NewWithMedia creates a pipeline on any audio link (see Media): a phone
+// stream as well as a WebRTC peer. Call Start() to launch it.
+func NewWithMedia(
+	ctx context.Context,
+	cfg *config.Config,
+	media Media,
+	sendEvent func(interface{}) error,
+	pluginMgr *plugin.Manager,
+	ragClient rag.Client,
+	opts PeerOptions,
+	conv *ConversationState,
+	resumed bool,
+) (*Pipeline, error) {
+	var err error
+	if conv == nil {
+		// No identity here: a Session always builds the conversation itself and
+		// passes it in, so reaching this means there is no session.
+		if conv, err = NewConversationState(cfg, "", ""); err != nil {
+			return nil, err
+		}
+	}
+	// The LLM client comes from the conversation, not from here: on a resumed
+	// session it is the same instance with the same message history, which is
+	// what makes the agent pick up mid-conversation rather than start over.
+	//
+	// TTS holds no conversation state and owns a provider connection that did
+	// not survive the drop, so it is always rebuilt. In realtime mode neither
+	// is built — the speech-to-speech provider replaces STT, LLM, and TTS at
+	// once, and constructing them would demand keys this deployment lacks.
+	llmClient := conv.LLM
+	var ttsClient tts.Client
+	if !cfg.RealtimeEnabled() {
+		ttsClient, err = tts.NewClientFor(cfg, opts.Voice)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	pCtx, cancel := context.WithCancel(ctx)
+
+	imgRecv := newImageReceiver()
+
+	p := &Pipeline{
+		ctx:           pCtx,
+		cancel:        cancel,
+		cfg:           cfg,
+		media:         media,
+		llmClient:     llmClient,
+		ttsClient:     ttsClient,
+		ragClient:     ragClient,
+		pluginMgr:     pluginMgr,
+		reflex:        newPartialReflex(pluginMgr),
+		report:        callreport.NewCall(conv.SessionID, resumed),
+		imageRecv:     imgRecv,
+		vad:           vad.NewDefault(),
+		bargeInVAD:    vad.NewBargeIn(),
+		inPCMCh:       make(chan PCMFrame, inPCMChSize),
+		finalCh:       make(chan TranscriptEvent, transcriptChSize),
+		transcriptCh:  make(chan TranscriptEvent, transcriptChSize),
+		outPCMCh:      make(chan PCMFrame, outPCMChSize),
+		interruptCh:   make(chan struct{}, 1),
+		duckChangeCh:  make(chan bool, 1),
+		realtimeReady: make(chan struct{}),
+		realtimeAudio: newRealtimeAudioQueue(),
+		conv:          conv,
+		transcriptLog: conv.Log,
+		// Shared with the conversation, so a resumed call keeps the summary
+		// of everything said before the drop.
+		rollingSummary:       conv.rollingSummary,
+		lastSummaryAtEntries: conv.lastSummaryAtEntries,
+		// A resumed caller is mid-conversation; greeting them again is the
+		// most audible way to tell them the agent forgot.
+		suppressGreeting: resumed,
+		callerSpokeFirst: make(chan struct{}),
+		sendEvent:        sendEvent,
+		direction:        opts.Direction,
+		markerNext:       true,
+	}
+
+	// Per session, not per server: one instance serves browsers and SIP calls
+	// at once, and a browser has already cancelled its echo upstream.
+	if cfg.EchoGuardFor(opts.AECAbsent) {
+		p.echoGuard = vad.NewEchoGuard(
+			time.Duration(cfg.Pipeline.EchoGuardWindowMs)*time.Millisecond,
+			cfg.Pipeline.EchoGuardGain,
+			cfg.Pipeline.EchoGuardMargin,
+		)
+		p.bargeInVAD.SetEchoReference(p.echoGuard)
+		log.Printf("[pipeline] echo guard on (mode %s, window %dms, gain %.2f, margin %.2f)",
+			cfg.Pipeline.EchoGuard, cfg.Pipeline.EchoGuardWindowMs,
+			cfg.Pipeline.EchoGuardGain, cfg.Pipeline.EchoGuardMargin)
+	}
+
+	// Realtime mode wires its own tools and instructions when the
+	// speech-to-speech session opens; the rest of this function configures
+	// the LLM client, which does not exist in that mode.
+	if cfg.RealtimeEnabled() {
+		p.lastAgentText.Store("")
+		p.interruptedText.Store("")
+		p.realtimeUserText.Store("")
+		return p, nil
+	}
+
+	// Wire plugins into the LLM as function-calling tools.
+	if pluginMgr != nil {
+		tools := pluginMgr.Tools()
+		if len(tools) > 0 {
+			defs := make([]llm.ToolDefinition, 0, len(tools))
+			for _, t := range tools {
+				defs = append(defs, llm.ToolDefinition{
+					Name:        t.Name(),
+					Description: t.Description(),
+					Parameters:  t.Parameters(),
+				})
+			}
+			llmClient.SetTools(defs)
+			llmClient.SetToolHandler(func(callCtx context.Context, call llm.ToolCall) (string, error) {
+				tool, ok := pluginMgr.GetTool(call.Name)
+				if !ok {
+					return "", fmt.Errorf("unknown tool: %s", call.Name)
+				}
+
+				// A tool that declares confirmation_required does not run on
+				// the first call: the model gets a challenge to read out and
+				// must call again with the token the user's yes authorised.
+				args, challenge, err := p.gateToolCall(tool, call.Arguments)
+				if err != nil {
+					return "", err
+				}
+				if challenge != "" {
+					return challenge, nil
+				}
+
+				// Play a soft thinking tone while the tool runs (opt-in via plugin.yaml).
+				if tool.ThinkingSound() {
+					done := make(chan struct{})
+					go func() { defer p.recoverKeepAlive("playThinkingSound"); p.playThinkingSound(done) }()
+					result, err := p.runTool(callCtx, tool, args)
+					close(done)
+					if err == nil {
+						p.playSentSound()
+					}
+					return result, err
+				}
+
+				return p.runTool(callCtx, tool, args)
+			})
+			log.Printf("[pipeline] registered %d tools with LLM", len(defs))
+		}
+
+		// Append skill instructions to system prompt.
+		skillsPrompt := pluginMgr.SkillsPrompt()
+		if skillsPrompt != "" {
+			llmClient.AppendSystemPrompt(skillsPrompt)
+			log.Printf("[pipeline] injected %d skills into system prompt", len(pluginMgr.Skills()))
+		}
+	}
+
+	// Teach the model the optional delivery tags. Without this rule the tag
+	// vocabulary is never emitted and ParseVoiceTag simply never fires, so
+	// voice controls stay at provider defaults.
+	llmClient.AppendSystemPrompt(
+		"\n\nOPTIONAL tone control: you may start a sentence with exactly one tag from " +
+			"[warm] [empathetic] [calm] [excited] to shape how it is spoken — e.g. " +
+			"\"[empathetic] I'm really sorry to hear that.\" Use it sparingly, only when the " +
+			"moment calls for it (apologies, bad news, congratulations). The tag is never " +
+			"spoken aloud. Never invent other tags.",
+	)
+
+	// Initialize atomic values with empty strings for type consistency.
+	p.lastAgentText.Store("")
+	p.interruptedText.Store("")
+
+	// A capture fires from its own timer once the spoken text stops changing,
+	// so the reflex needs a way back in that is not the STT callback.
+	if p.reflex != nil {
+		p.reflex.send = func(hit reflexHit) { p.fireReflex(hit, hit.tool.Name()) }
+	}
+
+	return p, nil
+}
+
+// recoverPanic is deferred directly by every goroutine that is part of the
+// pipeline's machinery. It turns a panic into a logged stack and a cancelled
+// pipeline, so one broken call winds down cleanly instead of taking the whole
+// process — and every other live call — with it.
+func (p *Pipeline) recoverPanic(name string) {
+	if r := recover(); r != nil {
+		log.Printf("[pipeline] panic in %s: %v\n%s", name, r, debug.Stack())
+		p.endedBy.CompareAndSwap(nil, "error")
+		p.cancel()
+	}
+}
+
+// recoverKeepAlive guards best-effort goroutines (greeting, thinking sound,
+// background summarisation, RAG prefetch) whose death should cost only their
+// own work, never the call.
+func (p *Pipeline) recoverKeepAlive(name string) {
+	if r := recover(); r != nil {
+		log.Printf("[pipeline] panic in %s (call continues): %v\n%s", name, r, debug.Stack())
+	}
+}
+
+// Start launches all pipeline goroutines and blocks until the context is cancelled.
+//
+// runReader and runSender are codec/transport work and run in both modes.
+// Between them, the classic path runs runInbound + runAgent (STT -> LLM ->
+// TTS) while realtime mode runs a single runRealtime loop against a
+// speech-to-speech provider.
+func (p *Pipeline) Start() {
+	var wg sync.WaitGroup
+
+	// Plugins reach a live conversation through the manager, which outlives
+	// any one session. Binding here is what lets a plugin push a packet or ask
+	// for a completion without holding a reference to this Pipeline.
+	if p.pluginMgr != nil {
+		if id := p.sessionID(); id != "" {
+			p.pluginMgr.BindSession(id, p)
+			defer p.pluginMgr.UnbindSession(id)
+		}
+	}
+
+	if p.cfg.RealtimeEnabled() {
+		wg.Add(3)
+		go func() { defer wg.Done(); defer p.recoverPanic("runReader"); p.runReader() }()
+		go func() { defer wg.Done(); defer p.recoverPanic("runRealtime"); p.runRealtime() }()
+		go func() { defer wg.Done(); defer p.recoverPanic("runSender"); p.runSender() }()
+		log.Printf("[pipeline] started in realtime mode (%s) — reader, realtime, sender", p.cfg.Realtime.Provider)
+	} else {
+		wg.Add(4)
+		go func() { defer wg.Done(); defer p.recoverPanic("runReader"); p.runReader() }()
+		go func() { defer wg.Done(); defer p.recoverPanic("runInbound"); p.runInbound() }()
+		go func() { defer wg.Done(); defer p.recoverPanic("runAgent"); p.runAgent() }()
+		go func() { defer wg.Done(); defer p.recoverPanic("runSender"); p.runSender() }()
+		log.Println("[pipeline] started — reader, inbound, agent, sender")
+	}
+
+	// Send initial greeting if configured. A resumed call skips it: the caller
+	// is mid-conversation and being greeted again is exactly how a dropped
+	// connection announces itself as a lost one.
+	if !p.suppressGreeting {
+		if p.cfg.RealtimeEnabled() {
+			// The provider connection is established inside runRealtime, so
+			// wait for the client before asking it to speak. GreetingDelayMs
+			// and GreetingFromAgent are not wired into the realtime
+			// (speech-to-speech) path -- its turn detection lives inside
+			// runRealtime, not runAgent, and it has no llm.Client to ask.
+			if g := p.greetingText(); g != "" {
+				go func() { defer p.recoverKeepAlive("greetRealtimeWhenReady"); p.greetRealtimeWhenReady(g) }()
+			}
+		} else if p.greetingText() != "" || p.cfg.Pipeline.GreetingFromAgent {
+			if delay := p.cfg.Pipeline.GreetingDelayMs; delay > 0 {
+				go func() { defer p.recoverKeepAlive("greet"); p.greetAfterDelay(time.Duration(delay) * time.Millisecond) }()
+			} else {
+				go func() { defer p.recoverKeepAlive("greet"); p.greetResolved() }()
+			}
+		}
+	}
+
+	wg.Wait()
+	// Anything else that ends a call (the line dropping, a hang-up, the
+	// page closing) is the caller's doing as far as the report goes.
+	endedBy, _ := p.endedBy.Load().(string)
+	if endedBy == "" {
+		endedBy = "caller"
+	}
+	p.report.End(endedBy, p.speaking.Load())
+	log.Println("[pipeline] stopped")
+}
+
+func (p *Pipeline) HandleDataChannelMessage(msg string) {
+	if p.imageRecv.handleMessage(msg) {
+		return
+	}
+}
+
+// dcDataPacket is the topic-addressed envelope the firmware's SDK
+// dispatches via its `on_data` callback. Payload is base64-encoded JSON.
+type dcDataPacket struct {
+	Type    string `json:"type"`    // always "data"
+	Topic   string `json:"topic"`   // e.g. "movement.command"
+	Payload string `json:"payload"` // base64-encoded JSON
+}
+
+// Stop cancels the pipeline context, tearing down all goroutines.
+func (p *Pipeline) Stop() {
+	p.cancel()
+}

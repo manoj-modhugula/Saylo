@@ -1,0 +1,51 @@
+# Saylo from the published images: no build, no Go or PyTorch toolchain.
+#
+#   cp .env.example .env                                # add your keys
+#   docker compose -f compose.release.yaml up           # Linux (Docker Engine)
+#   open http://localhost:8400
+#
+# SAYLO_TAG picks a version (default: latest), e.g. SAYLO_TAG=v0.2.0. Pin one in
+# production. Build the images with tools/release/build-images.sh when you want them.
+# The server and quickstart use host networking (WebRTC media needs the
+# server reachable on UDP). On Docker Desktop (Windows, WSL2, macOS) run
+# only the voice router here and the server natively: see README.
+services:
+  saylo:
+    image: ${SAYLO_SERVER_IMAGE:-saylo}:${SAYLO_TAG:-latest}
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./configs/saylo.toml:/config.toml:ro
+      - ./reports:/reports                  # call reports: saylo report reports
+    restart: unless-stopped
+
+  voice-router:
+    image: ${SAYLO_ROUTER_IMAGE:-saylo-voice-router}:${SAYLO_TAG:-latest}
+    ports:
+      - "8300:8300"
+    env_file: .env
+    command: ["--voice", "${SAYLO_VOICE:-${SAYLO_VOICE_GENDER:-female}}", "--default-voice", "${SAYLO_ENGLISH_VOICE:-}"]
+    volumes:
+      # Kokoro's weights download on first start into this volume.
+      - ${SAYLO_HF_CACHE:-hf-cache}:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  quickstart:
+    image: node:22-alpine
+    network_mode: host
+    env_file: .env
+    working_dir: /app
+    volumes:
+      - ./quickstart:/app:ro
+    command: ["node", "server.mjs"]
+    depends_on: [saylo]
+
+volumes:
+  hf-cache:

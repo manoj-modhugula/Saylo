@@ -1,0 +1,784 @@
+"""Kokoro-82M text-to-speech sidecar for StreamCore.
+
+Speaks the same HTTP contract as StreamCore's bundled VibeVoice TTS sidecar,
+so StreamCore's existing `vibevoice` TTS provider can use it by pointing
+`[vibevoice] tts_url` here -- no StreamCore code change:
+
+    POST /synthesize  {"text": "...", "voice": "..."}
+                      text may start with "[voice:male-2] " and/or "[lang:hi] "
+      -> 200, raw 16 kHz mono signed 16-bit little-endian PCM
+    GET  /health      -> {"status": "ok", ...}
+
+Why Kokoro: VibeVoice-Realtime-0.5B generated audio slower than real time on
+this machine's GPU (~5s for ~3.6s of speech), and StreamCore can only play a
+sentence once the whole sentence is back. Kokoro is an 82M-parameter model
+that generates a sentence far faster than it takes to say it.
+
+Languages: StreamCore sends only text, with no language, and the agent may
+speak whatever language the caller is speaking. So each sentence's language is
+detected here: by script (kana = Japanese, Han = Chinese, Devanagari =
+Hindi, Cyrillic = Russian or Ukrainian), otherwise with a detector limited to the
+Latin-script languages spoken here (English, Spanish, French, Italian,
+Portuguese, German, Dutch, Polish, Czech, Hungarian, Swedish, Romanian,
+Finnish, Danish, Vietnamese; Cyrillic is Ukrainian or Russian by its
+letters). Languages Kokoro doesn't speak are spoken by Piper, on the CPU. A sentence too
+short or unclear to tell ("Ok.") reuses the language spoken just before.
+Each language gets a matching Kokoro voice, male or female (--voice-gender).
+
+English uses --default-voice, which may be any Kokoro voice -- including a
+Hindi one ("hm_omega") for Indian-accented English. The request's "voice"
+field (StreamCore's VibeVoice voice name) is ignored.
+
+usage: python server.py [--port 8300] [--device cuda] [--default-voice af_heart] [--voice-gender female] [--spoken-names names.json]
+"""
+
+import argparse
+import base64
+import io
+import json
+import logging
+import os
+import re
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import wave
+
+import numpy as np
+import torch
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel
+from scipy.signal import resample_poly
+
+REPO_ID = "hexgrad/Kokoro-82M"
+MODEL_SAMPLE_RATE = 24000
+TARGET_SAMPLE_RATE = 16000  # what StreamCore's vibevoice TTS client expects
+
+logger = logging.getLogger("kokoro-tts")
+app = FastAPI(title="Kokoro TTS sidecar")
+
+_model = None
+_pipelines: dict = {}  # lang code -> KPipeline, all sharing _model
+_device = "cpu"
+# One model, many callers: StreamCore synthesizes sentences concurrently, and
+# a shared torch model isn't safe to run from several threads at once.
+_lock = threading.Lock()
+
+_VOICE_RE = re.compile(r"^[a-z][fm]_[a-z0-9]+$")
+
+# Kokoro pipeline language code and voices (female, male) per language.
+# Kokoro's pipeline (text-to-phoneme) code per language.
+VOICES = {"es": "e", "fr": "f", "it": "i", "pt": "p", "ja": "j", "zh": "z", "hi": "h"}
+
+# A persona is one consistent voice across every language: a Kokoro voice
+# for English and each Kokoro language (Hindi only as Sarvam's fallback),
+# and a Sarvam speaker for the Indian languages. Where Kokoro has a single
+# voice of a gender (Spanish, French, Italian, Portuguese), both personas of
+# that gender share it; Kokoro's "Santa" voices are a jolly character, not
+# a second voice. Chosen per server (--voice) or per request (the request's
+# "voice" field names a persona).
+PERSONAS = {
+    "female": {
+        "gender": "female", "english": "af_heart", "sarvam": "priya",
+        "kokoro": {"es": "ef_dora", "fr": "ff_siwis", "it": "if_sara", "pt": "pf_dora",
+                   "ja": "jf_alpha", "zh": "zf_xiaobei", "hi": "hf_alpha"},
+    },
+    "male": {
+        "gender": "male", "english": "am_michael", "sarvam": "rahul",
+        # Kokoro has no male French voice.
+        "kokoro": {"es": "em_alex", "fr": "ff_siwis", "it": "im_nicola", "pt": "pm_alex",
+                   "ja": "jm_kumo", "zh": "zm_yunxi", "hi": "hm_omega"},
+    },
+    "female-2": {
+        "gender": "female", "english": "af_bella", "sarvam": "neha",
+        "kokoro": {"es": "ef_dora", "fr": "ff_siwis", "it": "if_sara", "pt": "pf_dora",
+                   "ja": "jf_nezumi", "zh": "zf_xiaoni", "hi": "hf_beta"},
+    },
+    "male-2": {
+        "gender": "male", "english": "am_fenrir", "sarvam": "aditya",
+        "kokoro": {"es": "em_alex", "fr": "ff_siwis", "it": "im_nicola", "pt": "pm_alex",
+                   "ja": "jm_kumo", "zh": "zm_yunjian", "hi": "hm_psi"},
+    },
+}
+_persona = "female"
+_english_override: str | None = None  # --default-voice: English voice for the server's persona
+# --sarvam-speakers: a Sarvam voice per Indian language for the server's
+# persona ("hi=ritu,ta=kavitha"). One speaker rarely sounds native in every
+# language; a listener preferred "ritu" for Hindi over the persona's "priya".
+_sarvam_overrides: dict[str, str] = {}
+
+# Names the agent says in every language, spelled so each language's text-
+# to-phoneme step reads them as words. Heard in live checks: Spanish, Italian
+# and Portuguese spelled an all-caps name out letter by letter ("R X"), and
+# Japanese/Chinese dropped or garbled Latin-script words entirely ("Pro" came
+# out as "德尔"). Loaded from
+# --spoken-names (JSON: {"ja": {"ACME": "アクメ"}, ...}); see
+# spoken_names.example.json.
+SPOKEN_NAMES: dict[str, dict[str, str]] = {}
+
+
+def load_spoken_names(path: str | None) -> None:
+    global SPOKEN_NAMES
+    if not path:
+        return
+    with open(path, encoding="utf-8") as f:
+        SPOKEN_NAMES = json.load(f)
+    logger.info("spoken names loaded for %d languages from %s", len(SPOKEN_NAMES), path)
+
+
+# The word said after an amount, per currency symbol and language
+# ("₹4,999" -> "4999 rupias"). The G2P has no reading for the symbols, so
+# without this an amount is said with no currency at all. ¥ is left alone:
+# it's yen in Japanese and yuan in Chinese.
+CURRENCY_WORDS = {
+    "₹": {"en": "rupees", "es": "rupias", "fr": "roupies", "it": "rupie", "pt": "rúpias", "ja": "ルピー", "zh": "卢比", "hi": "रुपये", "de": "Rupien", "nl": "roepies", "ru": "рупий", "pl": "rupii", "uk": "рупій", "cs": "rupií", "hu": "rúpia", "sv": "rupier", "ro": "rupii", "fi": "rupiaa", "da": "rupees", "vi": "rupee"},
+    "$": {"en": "dollars", "es": "dólares", "fr": "dollars", "it": "dollari", "pt": "dólares", "ja": "ドル", "zh": "美元", "hi": "डॉलर", "de": "Dollar", "nl": "dollar", "ru": "долларов", "pl": "dolarów", "uk": "доларів", "cs": "dolarů", "hu": "dollár", "sv": "dollar", "ro": "dolari", "fi": "dollaria", "da": "dollars", "vi": "đô la"},
+    "€": {"en": "euros", "es": "euros", "fr": "euros", "it": "euro", "pt": "euros", "ja": "ユーロ", "zh": "欧元", "hi": "यूरो", "de": "Euro", "nl": "euro", "ru": "евро", "pl": "euro", "uk": "євро", "cs": "eur", "hu": "euró", "sv": "euro", "ro": "euro", "fi": "euroa", "da": "euro", "vi": "euro"},
+    "£": {"en": "pounds", "es": "libras", "fr": "livres", "it": "sterline", "pt": "libras", "ja": "ポンド", "zh": "英镑", "hi": "पाउंड", "de": "Pfund", "nl": "pond", "ru": "фунтов", "pl": "funtów", "uk": "фунтів", "cs": "liber", "hu": "font", "sv": "pund", "ro": "lire", "fi": "puntaa", "da": "pund", "vi": "bảng Anh"},
+}
+
+_detector = None
+_last_language = "en"
+_last_language_at = 0.0
+STICKY_SECONDS = 30.0
+
+
+def _latin_detector():
+    global _detector
+    if _detector is None:
+        from lingua import Language, LanguageDetectorBuilder
+
+        _detector = LanguageDetectorBuilder.from_languages(
+            Language.ENGLISH, Language.SPANISH, Language.FRENCH, Language.ITALIAN, Language.PORTUGUESE,
+            Language.GERMAN, Language.DUTCH, Language.POLISH, Language.CZECH, Language.HUNGARIAN,
+            Language.SWEDISH, Language.ROMANIAN, Language.FINNISH, Language.DANISH, Language.VIETNAMESE,
+        ).build()
+    return _detector
+
+
+_LINGUA_CODES = {"ENGLISH": "en", "SPANISH": "es", "FRENCH": "fr", "ITALIAN": "it", "PORTUGUESE": "pt",
+                 "GERMAN": "de", "DUTCH": "nl", "POLISH": "pl", "CZECH": "cs", "HUNGARIAN": "hu",
+                 "SWEDISH": "sv", "ROMANIAN": "ro", "FINNISH": "fi", "DANISH": "da", "VIETNAMESE": "vi"}
+
+
+# Unicode blocks of the Indic scripts Sarvam speaks (Devanagari is handled
+# above: it's shared by Hindi and Marathi, so only a tag can tell them apart).
+_INDIC_SCRIPTS = [
+    ("bn", "\u0980", "\u09ff"),  # Bengali
+    ("pa", "\u0a00", "\u0a7f"),  # Gurmukhi
+    ("gu", "\u0a80", "\u0aff"),  # Gujarati
+    ("od", "\u0b00", "\u0b7f"),  # Odia
+    ("ta", "\u0b80", "\u0bff"),  # Tamil
+    ("te", "\u0c00", "\u0c7f"),  # Telugu
+    ("kn", "\u0c80", "\u0cff"),  # Kannada
+    ("ml", "\u0d00", "\u0d7f"),  # Malayalam
+]
+
+
+def _indic_script(text: str) -> str | None:
+    for lang, lo, hi in _INDIC_SCRIPTS:
+        if any(lo <= ch <= hi for ch in text):
+            return lang
+    return None
+
+
+_LANG_TAG = re.compile(r"^\s*\[lang:([a-zA-Z-]{2,8})\]\s*")
+_VOICE_TAG = re.compile(r"^\s*\[voice:([a-zA-Z0-9-]{2,20})\]\s*")
+
+
+def take_language_tag(text: str) -> tuple[str | None, str]:
+    """The agent may prefix its lines with "[lang:ta] " so the language is exact
+    rather than guessed (Hindi and Marathi share a script). Returns the
+    language and the text without the tag."""
+    m = _LANG_TAG.match(text)
+    if not m:
+        return None, text
+    return m.group(1).lower()[:2], text[m.end():]
+
+
+def take_voice_tag(text: str) -> tuple[str | None, str]:
+    """The agent may prefix a line with "[voice:male-2] " to pick the persona
+    for that line: one server can speak for several companies, each with its
+    own voice, although StreamCore sends a single fixed voice name. Returns
+    the persona and the text without the tag; an unknown persona is ignored."""
+    m = _VOICE_TAG.match(text)
+    if not m:
+        return None, text
+    name = m.group(1).lower()
+    return (name if name in PERSONAS else None), text[m.end():]
+
+
+def remember_language(language: str) -> None:
+    global _last_language, _last_language_at
+    _last_language, _last_language_at = language, time.monotonic()
+
+
+def detect_language(text: str) -> str:
+    """The language of one sentence, or the recent one if it can't tell."""
+    global _last_language, _last_language_at
+    now = time.monotonic()
+    recent = _last_language if now - _last_language_at < STICKY_SECONDS else "en"
+
+    if re.search(r"[\u3040-\u30ff]", text):
+        found = "ja"
+    elif re.search(r"[\u4e00-\u9fff]", text):
+        found = "zh"
+    elif re.search(r"[\u0400-\u04ff]", text):
+        # Cyrillic: Ukrainian if it has a letter Russian doesn't (і ї є ґ).
+        found = "uk" if re.search(r"[іїєґІЇЄҐ]", text) else "ru"
+    elif (indic := _indic_script(text)) is not None:
+        found = indic
+    # Devanagari letters -- not the danda "।" (U+0964/5), which lives in the
+    # Devanagari block but ends sentences in Bengali, Punjabi and Odia too.
+    elif re.search(r"[\u0900-\u0963\u0966-\u097f]", text):
+        found = "hi"  # Hindi unless a [lang:mr] tag says Marathi
+    else:
+        letters = re.sub(r"[^A-Za-zÀ-ɏḀ-ỿ]", "", text)
+        found = None
+        if len(letters) >= 12:
+            ranked = _latin_detector().compute_language_confidence_values(text)
+            if ranked and ranked[0].value >= 0.6:
+                found = _LINGUA_CODES.get(ranked[0].language.name)
+        found = found or recent
+
+    _last_language, _last_language_at = found, now
+    return found
+
+
+def _fix_espeak_data_path() -> None:
+    """Make the espeak-ng bundled by espeakng_loader find its own data.
+
+    Kokoro's text-to-phoneme step falls back to espeak-ng for words it doesn't
+    know (and uses it outright for Hindi). The bundled library (espeakng_loader
+    0.2.4, espeak-ng 1.52) rejects the data directory misaki hands it, falls
+    back to the path compiled in on the package's CI machine
+    ("/home/runner/work/..."), and then exit()s the whole process -- no Python
+    exception -- with "phontab: No such file or directory". Found by trial: it
+    only accepts a directory that holds the data files *and* has an
+    "espeak-ng-data" entry inside it. So build one: symlinks to every data file
+    plus "espeak-ng-data" -> ".", and hand that to phonemizer instead.
+    """
+    try:
+        import espeakng_loader
+        import misaki.espeak  # noqa: F401 -- runs misaki's (broken) set_data_path once, first
+        from phonemizer.backend.espeak.wrapper import EspeakWrapper
+    except ImportError:
+        return
+    source = espeakng_loader.get_data_path()
+    shim = os.path.join(tempfile.gettempdir(), f"kokoro-tts-espeak-{os.getuid()}")
+    os.makedirs(shim, exist_ok=True)
+    for name in os.listdir(source):
+        link = os.path.join(shim, name)
+        if not os.path.lexists(link):
+            os.symlink(os.path.join(source, name), link)
+    if not os.path.lexists(os.path.join(shim, "espeak-ng-data")):
+        os.symlink(".", os.path.join(shim, "espeak-ng-data"))
+    EspeakWrapper.set_data_path(shim)
+
+
+def persona_for(requested: str) -> dict:
+    """The request's persona if it names one, else the server's."""
+    return PERSONAS.get((requested or "").strip().lower(), PERSONAS[_persona])
+
+
+def english_voice(persona: dict) -> str:
+    if _english_override and persona is PERSONAS[_persona]:
+        return _english_override
+    return persona["english"]
+
+
+# ---------------------------------------------------------------------------
+# Piper: local voices for languages Kokoro doesn't speak. CPU, ~real time x10.
+# piper-tts 1.2.0 is MIT (later releases are GPL). Every voice here is
+# trained on CC0, CC BY 4.0 or Apache 2.0 data, checked per voice's
+# MODEL_CARD and credited in NOTICE. Turkish, Korean and Arabic have Piper
+# voices, but only on non-commercial or unlicensed data, so they stay
+# unspoken. Transcribed back with Whisper large-v3, a payment line with an
+# amount: 0.92-1.00. Greek is left out: its one licensed voice read back at
+# 0.82.
+PIPER_REPO = "rhasspy/piper-voices"
+PIPER_REVISION = "c10ece1aade47bb51c153c893d14e5bf8e5b7117"
+PIPER_VOICES = {
+    "de": {"female": "de_DE-kerstin-low", "male": "de_DE-thorsten-high"},
+    "nl": {"female": "nl_BE-nathalie-medium", "male": "nl_BE-rdh-medium"},
+    # No CC0 female Russian voice: dmitri for both.
+    "ru": {"female": "ru_RU-dmitri-medium", "male": "ru_RU-dmitri-medium"},
+    "pl": {"female": "pl_PL-gosia-medium", "male": "pl_PL-darkman-medium"},
+    "uk": {"female": "uk_UA-tetiana-high", "male": "uk_UA-mykyta-high"},
+    "cs": {"female": "cs_CZ-kasandra-medium", "male": "cs_CZ-jirka-medium"},
+    "hu": {"female": "hu_HU-berta-medium", "male": "hu_HU-imre-medium"},
+    "sv": {"female": "sv_SE-alma-medium", "male": "sv_SE-nst-medium"},
+    # One licensed voice: it speaks for both genders.
+    "ro": {"female": "ro_RO-mihai-medium", "male": "ro_RO-mihai-medium"},
+    "fi": {"female": "fi_FI-harri-medium", "male": "fi_FI-harri-medium"},
+    "da": {"female": "da_DK-talesyntese-medium", "male": "da_DK-talesyntese-medium"},
+    "vi": {"female": "vi_VN-vais1000-medium", "male": "vi_VN-vais1000-medium"},
+}
+_piper: dict = {}  # voice key -> PiperVoice, once loaded
+_piper_lock = threading.Lock()  # its own: a Piper line never waits on Kokoro
+
+
+def piper_voice(language: str, persona: dict) -> str:
+    return PIPER_VOICES[language][persona["gender"]]
+
+
+def load_piper() -> None:
+    """Downloads (once, into the Hugging Face cache) and loads every Piper
+    voice. A voice that fails to load leaves its language unspoken."""
+    from huggingface_hub import hf_hub_download
+    from piper import PiperVoice
+
+    for key in sorted({k for voices in PIPER_VOICES.values() for k in voices.values()}):
+        locale, name, quality = key.split("-")
+        path = f"{locale[:2]}/{locale}/{name}/{quality}/{key}.onnx"
+        try:
+            onnx = hf_hub_download(PIPER_REPO, path, revision=PIPER_REVISION)
+            hf_hub_download(PIPER_REPO, path + ".json", revision=PIPER_REVISION)
+            _piper[key] = PiperVoice.load(onnx, use_cuda=False)
+        except Exception as exc:
+            logger.warning("couldn't load Piper voice %s: %s", key, exc)
+
+
+def synthesize_piper(text: str, key: str) -> bytes:
+    voice = _piper[key]
+    with _piper_lock:
+        raw = b"".join(voice.synthesize_stream_raw(text))
+    audio = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768
+    rate = voice.config.sample_rate
+    if rate != TARGET_SAMPLE_RATE:
+        g = np.gcd(rate, TARGET_SAMPLE_RATE)
+        audio = resample_poly(audio, TARGET_SAMPLE_RATE // g, rate // g)
+    return (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+
+
+def voice_for(language: str, persona: dict) -> tuple[str, str]:
+    """(Kokoro pipeline code, voice) for a language."""
+    if language in VOICES:
+        return VOICES[language], persona["kokoro"][language]
+    # English (and anything unexpected): the persona's voice, or
+    # --default-voice for the server's own persona (a request for another
+    # persona keeps that persona's, so its gender stays right). Read with the
+    # British G2P for British voices and American for everything else --
+    # including a Hindi voice reading English.
+    english = english_voice(persona)
+    return ("b" if english.startswith("b") else "a"), english
+
+
+def _pipeline(lang: str):
+    from kokoro import KPipeline
+
+    if lang not in _pipelines:
+        _pipelines[lang] = KPipeline(lang_code=lang, repo_id=REPO_ID, model=_model)
+    return _pipelines[lang]
+
+
+# Indian grouping first ("1,00,000"), then thousands groups, then plain.
+_LAKH = r"\d{1,2}(?:,\d{2})+,\d{3}(?:\.\d+)?"
+_NUMBER = _LAKH + r"|\d{1,3}(?:[.,\s\u00a0\u202f]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?"
+
+
+def normalize(text: str, language: str = "en") -> str:
+    for name, spoken in SPOKEN_NAMES.get(language, {}).items():
+        text = re.sub(rf"(?<![A-Za-z]){name}(?![A-Za-z])", spoken, text)
+
+    def amount(digits: str, word: str) -> str:
+        # Outside English, "4,999" or "4.999" is read as a decimal; plain
+        # digits are read as the whole number in every language.
+        if re.fullmatch(_LAKH, digits):
+            digits = digits.replace(",", "")  # "1,00,000" -> "100000", read right everywhere
+        elif language != "en":
+            digits = re.sub(r"(\d)[,.\s\u00a0\u202f](?=\d{3}\b)", r"\1", digits)
+        # "$12.50" is "12 dollars 50", not "twelve point five dollars".
+        cents = re.fullmatch(r"(.+?)[.,](\d{2})", digits)
+        if cents:
+            return f"{cents.group(1)} {word} {cents.group(2)}"
+        return f"{digits} {word}"
+
+    for symbol, words in CURRENCY_WORDS.items():
+        word = words.get(language, words["en"])
+        sym = re.escape(symbol)
+        # "₹4,999" (symbol first) and "4.999 €" (symbol after, as many
+        # languages write it) both become "<number> <word>".
+        text = re.sub(rf"{sym}\s?({_NUMBER})", lambda m: amount(m.group(1), word), text)
+        text = re.sub(rf"({_NUMBER})\s?{sym}", lambda m: amount(m.group(1), word), text)
+        text = text.replace(symbol, f" {word} ")
+    return re.sub(r"  +", " ", text).strip()
+
+
+# ---------------------------------------------------------------------------
+# Sarvam: the voice for Indian languages. Cloud, ~1.3-2s a sentence, and
+# intelligible in every Indian language tested (checked by transcribing its
+# audio back). Kokoro stays the voice for everything else, and the fallback
+# for Hindi and Marathi when Sarvam is down.
+# ---------------------------------------------------------------------------
+
+SARVAM_LANGUAGES = {"hi", "bn", "ta", "te", "kn", "ml", "mr", "gu", "pa", "od"}
+SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
+SARVAM_MODEL = "bulbul:v3"
+SARVAM_TIMEOUT_S = 6.0
+# Kokoro can read Devanagari: Hindi natively, Marathi passably.
+KOKORO_FALLBACK = {"hi": "hi", "mr": "hi"}
+
+
+class SarvamBreaker:
+    """Stops calling Sarvam for a while after repeated failures, so a
+    Sarvam outage costs one quick failure per sentence at most a few times,
+    not a timeout on every line -- and /health can tell the agent to stop choosing
+    languages only Sarvam can speak."""
+
+    def __init__(self, threshold: int = 2, cooldown_s: float = 60.0):
+        self.threshold, self.cooldown_s = threshold, cooldown_s
+        self.failures, self.open_until = 0, 0.0
+        self.reason = ""  # why it's down, for /health
+        self.suspended = False  # down for an account problem that may be fixed (credits)
+        self.lock = threading.Lock()
+
+    def available(self) -> bool:
+        return time.monotonic() >= self.open_until
+
+    def disable(self, reason: str) -> None:
+        """Down for good: a rejected key won't start working on its own."""
+        with self.lock:
+            self.open_until, self.reason, self.suspended = float("inf"), reason, False
+        logger.error("Sarvam voice disabled: %s", reason)
+
+    def suspend(self, reason: str, seconds: float) -> None:
+        """Down for a long while: the account can't be used right now (no
+        credits) but may be topped up, so it's retried later -- and checked
+        every minute meanwhile (sarvam_recheck_loop)."""
+        with self.lock:
+            was_down = self.suspended
+            self.open_until = max(self.open_until, time.monotonic() + seconds)
+            self.reason, self.suspended = reason, True
+        if not was_down:
+            logger.error("Sarvam voice down for up to %.0f min: %s", seconds / 60, reason)
+
+    def success(self) -> None:
+        with self.lock:
+            was_down = self.suspended
+            self.failures, self.open_until, self.reason, self.suspended = 0, 0.0, "", False
+        if was_down:
+            logger.info("Sarvam voice is back")
+
+    def failure(self) -> None:
+        with self.lock:
+            self.failures += 1
+            if self.failures >= self.threshold:
+                self.open_until = time.monotonic() + self.cooldown_s
+                self.reason = f"{self.failures} failures in a row"
+                logger.warning("Sarvam voice marked down for %.0fs after %d failures", self.cooldown_s, self.failures)
+
+
+_sarvam_key = os.environ.get("SARVAM_API_KEY", "")
+_sarvam_breaker = SarvamBreaker()
+
+
+def sarvam_available() -> bool:
+    return bool(_sarvam_key) and _sarvam_breaker.available()
+
+
+def sarvam_recheck_loop(every_s: float = 60.0) -> None:
+    """Out of credits, an account can be topped up at any moment. Waiting out
+    the whole suspension kept Indian languages off for ten minutes after a
+    top-up (live, 2026-10-25), so ask once a minute with one short word and
+    bring them back as soon as Sarvam answers. A rejected key stays down: it
+    won't fix itself."""
+    while True:
+        time.sleep(every_s)
+        if not (_sarvam_breaker.suspended and not _sarvam_breaker.available()):
+            continue
+        try:
+            _sarvam_once("नमस्ते", "hi")
+            _sarvam_breaker.success()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                account_problem(exc)
+        except Exception:
+            pass  # still down, or the network blinked: ask again next minute
+
+
+# When a caller's line was last voiced; the keep-warm loop runs Kokoro after a quiet spell.
+_last_use = time.monotonic()
+
+
+def keep_warm_loop(idle_s: float) -> None:
+    """After an hour without calls, the GPU took 3.0s for a one-second line
+    (0.4x real time, 2026-10-25) where it takes 0.5s warm: the first caller
+    after a quiet spell waited, or failover moved them to a paid voice. One
+    word through Kokoro after each idle_s of quiet keeps the GPU ready. It
+    bypasses synthesize(), so it isn't logged and doesn't count as the last
+    language heard. A caller's line arriving at that moment waits ~0.1s."""
+    last_warm = time.monotonic()
+    while True:
+        time.sleep(max(1.0, idle_s / 4))
+        if time.monotonic() - max(_last_use, last_warm) < idle_s:
+            continue
+        last_warm = time.monotonic()
+        try:
+            lang, kokoro_voice = voice_for("en", PERSONAS[_persona])
+            with _lock:
+                for _ in _pipeline(lang)("Okay.", voice=kokoro_voice, speed=1.0):
+                    pass
+        except Exception as exc:
+            logger.warning("keep-warm line failed: %s", exc)
+
+
+def _sarvam_once(text: str, language: str, speaker: str | None = None) -> bytes:
+    body = json.dumps({
+        "text": text,
+        "target_language_code": f"{language}-IN",
+        "speaker": speaker or PERSONAS[_persona]["sarvam"],
+        "model": SARVAM_MODEL,
+        "speech_sample_rate": TARGET_SAMPLE_RATE,
+    }).encode()
+    req = urllib.request.Request(SARVAM_TTS_URL, data=body, method="POST",
+                                 headers={"api-subscription-key": _sarvam_key, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=SARVAM_TIMEOUT_S) as res:
+        payload = json.loads(res.read())
+    audio = base64.b64decode(payload["audios"][0])
+    with wave.open(io.BytesIO(audio)) as w:
+        if w.getframerate() != TARGET_SAMPLE_RATE or w.getnchannels() != 1 or w.getsampwidth() != 2:
+            raise RuntimeError(f"unexpected Sarvam audio: {w.getframerate()} Hz, {w.getnchannels()} ch")
+        return w.readframes(w.getnframes())
+
+
+def sarvam_speaker(persona: dict, language: str) -> str:
+    """The persona's Sarvam voice, or the per-language override for the
+    server's own persona."""
+    if persona is PERSONAS[_persona] and language in _sarvam_overrides:
+        return _sarvam_overrides[language]
+    return persona["sarvam"]
+
+
+def parse_sarvam_speakers(spec: str | None) -> dict[str, str]:
+    """"hi=ritu,ta=kavitha" -> {"hi": "ritu", "ta": "kavitha"}; bad pairs skipped."""
+    out: dict[str, str] = {}
+    for pair in (spec or "").split(","):
+        lang, _, speaker = pair.strip().partition("=")
+        if re.fullmatch(r"[a-z]{2,3}", lang.strip().lower()) and re.fullmatch(r"[a-z]{2,20}", speaker.strip().lower()):
+            out[lang.strip().lower()] = speaker.strip().lower()
+    return out
+
+
+def synthesize_sarvam(text: str, language: str, speaker: str | None = None) -> bytes:
+    """One retry for a transient error; a request Sarvam rejects (4xx) isn't
+    retried."""
+    last: Exception | None = None
+    for attempt in range(2):
+        try:
+            pcm = _sarvam_once(text, language, speaker)
+            _sarvam_breaker.success()
+            return pcm
+        except urllib.error.HTTPError as exc:
+            last = exc
+            if account_problem(exc):
+                raise RuntimeError(f"Sarvam voice failed: {exc}") from exc
+            if 400 <= exc.code < 500 and exc.code != 429:
+                break
+        except Exception as exc:  # timeout, connection, bad payload
+            last = exc
+    _sarvam_breaker.failure()
+    raise RuntimeError(f"Sarvam voice failed: {last}")
+
+
+def account_problem(exc: urllib.error.HTTPError) -> bool:
+    """A rejected key (401/403) or an account out of credits (402) fails
+    every request until someone fixes the account, so Sarvam is taken out at
+    once -- and /health stops offering its languages -- rather than after
+    failures on a caller's lines. Live: credits ran out mid-test, and Tamil
+    replies went silent while /health still listed Tamil."""
+    if exc.code in (401, 403):
+        _sarvam_breaker.disable(f"key rejected (HTTP {exc.code})")
+        return True
+    if exc.code == 402:
+        _sarvam_breaker.suspend("account out of credits (HTTP 402)", 600)
+        return True
+    return False
+
+
+def speakable_languages() -> list[str]:
+    """What this server can voice right now; an agent should only answer in these."""
+    languages = ["en", *VOICES]
+    languages += [lang for lang, voices in PIPER_VOICES.items() if all(k in _piper for k in voices.values())]
+    if sarvam_available():
+        languages += sorted(SARVAM_LANGUAGES - set(languages))
+    return languages
+
+
+def synthesize(text: str, voice: str = "") -> bytes:
+    global _last_use
+    _last_use = time.monotonic()
+    tagged_voice, text = take_voice_tag(text)
+    persona = persona_for(tagged_voice or voice)
+    tagged, text = take_language_tag(text)
+    language = tagged or detect_language(text)
+    remember_language(language)
+    if language in SARVAM_LANGUAGES and sarvam_available():
+        try:
+            pcm = synthesize_sarvam(text, language, sarvam_speaker(persona, language))
+            logger.info("language %s -> Sarvam %s", language, sarvam_speaker(persona, language))
+            return pcm
+        except Exception as exc:
+            if language not in KOKORO_FALLBACK:
+                raise
+            logger.warning("%s; falling back to Kokoro for %s", exc, language)
+    if language in SARVAM_LANGUAGES:
+        if language not in KOKORO_FALLBACK:
+            raise RuntimeError(f"no voice available for {language}: Sarvam is down or not configured")
+        language = KOKORO_FALLBACK[language]
+    if language in PIPER_VOICES:
+        key = piper_voice(language, persona)
+        if key not in _piper:
+            raise RuntimeError(f"no voice available for {language}: Piper voice {key} isn't loaded")
+        logger.info("language %s -> Piper %s", language, key)
+        return synthesize_piper(normalize(text, language), key)
+    lang, kokoro_voice = voice_for(language, persona)
+    logger.info("language %s -> voice %s", language, kokoro_voice)
+    text = normalize(text, language)
+    with _lock:
+        parts = [
+            r.audio.detach().float().cpu().numpy()
+            for r in _pipeline(lang)(text, voice=kokoro_voice, speed=1.0)
+            if r.audio is not None
+        ]
+    if not parts:
+        return b""
+    audio = np.concatenate(parts)
+    audio = resample_poly(audio, TARGET_SAMPLE_RATE // 8000, MODEL_SAMPLE_RATE // 8000)
+    return (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+
+
+class SynthesizeRequest(BaseModel):
+    text: str
+    voice: str = ""
+
+
+@app.post("/synthesize")
+def synthesize_endpoint(req: SynthesizeRequest):
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="text must not be empty")
+    start = time.perf_counter()
+    try:
+        pcm = synthesize(req.text, req.voice)
+    except Exception as exc:  # surface the reason to StreamCore's log
+        logger.exception("synthesis failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    took = time.perf_counter() - start
+    seconds = len(pcm) / 2 / TARGET_SAMPLE_RATE
+    logger.info(
+        "synthesized %.2fs of audio in %.3fs (%.1fx real time) for %d chars",
+        seconds, took, seconds / took if took else 0, len(req.text),
+    )
+    return Response(content=pcm, media_type="application/octet-stream")
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model": REPO_ID,
+        "device": _device,
+        "voice": _persona,
+        "voice_gender": PERSONAS[_persona]["gender"],
+        "voices": {name: {"gender": p["gender"], "english": english_voice(p), "sarvam": p["sarvam"]}
+                   for name, p in PERSONAS.items()},
+        "languages": speakable_languages(),
+        # Lines may carry "[voice:<persona>] " to choose the persona per line.
+        "voice_tags": True,
+        "sarvam": "not configured" if not _sarvam_key else ("up" if _sarvam_breaker.available() else "down"),
+        # Why, while it's down: "account out of credits (HTTP 402)", "key rejected (HTTP 401)"...
+        **({"sarvam_reason": _sarvam_breaker.reason} if _sarvam_key and not _sarvam_breaker.available() else {}),
+    }
+
+
+def main():
+    global _model, _device, _persona, _english_override, _sarvam_overrides
+    parser = argparse.ArgumentParser(description="Kokoro TTS sidecar for StreamCore")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8300)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--voice", choices=sorted(PERSONAS), help="voice persona for every language (default: --voice-gender)")
+    parser.add_argument("--voice-gender", choices=["female", "male"], default="female", help="shorthand for --voice female / male")
+    parser.add_argument("--default-voice", default=None, help="Kokoro voice for English, overriding the persona's (hm_omega: Indian-accented English)")
+    parser.add_argument("--sarvam-speakers", default=os.environ.get("SAYLO_SARVAM_SPEAKERS"), help="Sarvam voice per language for the persona, e.g. hi=ritu,ta=kavitha")
+    parser.add_argument("--spoken-names", default=os.environ.get("SAYLO_SPOKEN_NAMES"), help="JSON file: how to spell names per language")
+    parser.add_argument("--keep-warm-s", type=float, default=float(os.environ.get("SAYLO_KEEP_WARM_S", "60")),
+                        help="voice a word after this many idle seconds, so the GPU is ready for the next caller (0: off)")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+    load_spoken_names(args.spoken_names)
+
+    _fix_espeak_data_path()
+    from kokoro import KModel
+
+    _device = args.device
+    _persona = args.voice or args.voice_gender
+    _english_override = args.default_voice if args.default_voice and _VOICE_RE.match(args.default_voice) else None
+    _sarvam_overrides = parse_sarvam_speakers(args.sarvam_speakers)
+    if _sarvam_overrides:
+        logger.info("Sarvam voice per language: %s", _sarvam_overrides)
+    logger.info("loading %s on %s", REPO_ID, _device)
+    _model = KModel(repo_id=REPO_ID).to(_device).eval()
+    # Warm up so the first real request doesn't pay for the voice download,
+    # CUDA kernel setup and the G2P's first load.
+    # Check the Sarvam key once, up front. A rejected key would otherwise
+    # surface only on a caller's first lines -- as silence, for languages
+    # no local voice can speak -- before the breaker learned it.
+    if _sarvam_key:
+        try:
+            _sarvam_once("नमस्ते", "hi")
+            logger.info("Sarvam voice key accepted")
+        except urllib.error.HTTPError as exc:
+            if not account_problem(exc):
+                _sarvam_breaker.failure()
+        except Exception as exc:
+            logger.warning("Sarvam voice check failed at startup: %s", exc)
+            _sarvam_breaker.failure()
+    load_piper()
+    synthesize("Hello, this is a warm up.")
+    # Every other language too: each loads its own text-to-phoneme pipeline
+    # and voice on first use (~3s), which a caller would otherwise hear as a
+    # pause before the agent's first line in that language.
+    for sample in ("Hola, esto es una prueba.", "Bonjour, ceci est un test.", "Ciao, questa è una prova.",
+                   "Olá, isto é um teste.", "こんにちは、テストです。", "你好，这是测试。", "नमस्ते, यह एक परीक्षण है।"):
+        synthesize(sample)
+    for language, sample in (("de", "Hallo, das ist ein Test."), ("nl", "Hallo, dit is een test."),
+                             ("ru", "Привет, это тест."), ("pl", "Cześć, to jest test."),
+                             ("uk", "Привіт, це тест."), ("cs", "Ahoj, tohle je test."), ("hu", "Szia, ez egy teszt."),
+                             ("sv", "Hej, det här är ett test."), ("ro", "Salut, acesta este un test."),
+                             ("fi", "Hei, tämä on testi."), ("da", "Hej, det er en test."), ("vi", "Xin chào, đây là một bài kiểm tra.")):
+        for key in set(PIPER_VOICES[language].values()):
+            if key in _piper:
+                synthesize_piper(sample, key)
+    # The other personas share those pipelines; only their voice packs are
+    # still to load, which is quick and needs no synthesis.
+    for persona in PERSONAS.values():
+        for language in ("en", *VOICES):
+            code, kokoro_voice = voice_for(language, persona)
+            try:
+                with _lock:
+                    _pipeline(code).load_voice(kokoro_voice)
+            except Exception as exc:
+                logger.warning("couldn't preload voice %s: %s", kokoro_voice, exc)
+    logger.info(
+        "ready (voice %s, English %s; Piper %d/%d voices; Sarvam %s)",
+        _persona,
+        english_voice(PERSONAS[_persona]),
+        len(_piper), len({k for v in PIPER_VOICES.values() for k in v.values()}),
+        ("on for " + ", ".join(sorted(SARVAM_LANGUAGES)) if sarvam_available() else "DOWN -- Indian languages other than Hindi can't be spoken")
+        if _sarvam_key
+        else "off: SARVAM_API_KEY not set",
+    )
+    if _sarvam_key:
+        threading.Thread(target=sarvam_recheck_loop, daemon=True, name="sarvam-recheck").start()
+    if args.keep_warm_s > 0:
+        threading.Thread(target=keep_warm_loop, args=(args.keep_warm_s,), daemon=True, name="keep-warm").start()
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+
+
+if __name__ == "__main__":
+    main()

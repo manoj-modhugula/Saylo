@@ -1,0 +1,324 @@
+// Saylo quickstart: talk to a voice agent from your browser, in any language.
+//
+// One process, three jobs, no dependencies (Node 20+):
+//   - :8400  the call page, and a WHIP proxy to the Saylo server
+//   - :9101  a demo agent answering Saylo's agent requests (greeting, chat,
+//            listen, oneshot) -- the part you replace with your own app
+//
+//   node examples/quickstart/server.mjs      then open http://localhost:8400
+//
+// Why a proxy: Saylo learns who is on the call from the
+// X-StreamCore-Resource-Id header (a phone bridge sends the dialled number).
+// Browsers can't send that header cross-origin, so the page talks WHIP to
+// this server, which forwards it with the header added. Audio itself goes
+// straight to the Saylo server.
+import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
+
+const SAYLO = process.env.SAYLO_URL ?? "http://127.0.0.1:8080";
+const PAGE_PORT = Number(process.env.PAGE_PORT ?? 8400);
+const AGENT_PORT = Number(process.env.AGENT_PORT ?? 9101);
+// Must match [agent] api_key / STREAMCORE_AGENT_API_KEY on the Saylo server.
+const AGENT_KEY = process.env.STREAMCORE_AGENT_API_KEY ?? "";
+const GROQ_KEY = process.env.GROQ_API_KEY ?? "";
+const MODEL = process.env.QUICKSTART_MODEL ?? "openai/gpt-oss-20b";
+// OpenAI backs Groq up: asked when Groq fails, or hasn't answered within
+// HEDGE_MS (the first reply wins). Unset OPENAI_API_KEY to use Groq alone.
+const OPENAI_KEY = process.env.OPENAI_API_KEY ?? "";
+const OPENAI_MODEL = process.env.QUICKSTART_OPENAI_MODEL ?? "gpt-4.1-mini";
+const HEDGE_MS = Number(process.env.QUICKSTART_HEDGE_MS ?? 1200);
+// The voice router's health: which languages it can speak right now.
+const VOICE_HEALTH = process.env.VOICE_HEALTH_URL ?? "http://127.0.0.1:8300/health";
+
+const ts = () => new Date().toISOString().slice(11, 23);
+const page = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+
+// --- live feed to the page (server-sent events) -----------------------------
+const feeds = new Set();
+function publish(event) {
+  const line = `data: ${JSON.stringify(event)}\n\n`;
+  for (const res of feeds) res.write(line);
+}
+
+// --- who's calling ------------------------------------------------------------
+// A real app knows its caller from the dialled number. Here the page says who
+// it is before connecting: a name, the language on record, and whether the
+// number is Indian -- what Saylo's adaptive listener starts from.
+const callers = new Map(); // resourceId -> { name, language, region }
+let callNo = 0;
+let currentResource = "";
+
+// --- the demo agent -------------------------------------------------------------
+// Saylo posts every turn here. The contract (docs/saylo/agent-contract.md):
+//   listen   -> { language?, region? }     before the caller speaks
+//   greeting -> { text }                   the opening line
+//   chat     -> { text, end_call? }        answer what the caller said
+//   oneshot  -> { text }                   background work; nothing to do here
+const sessions = new Map(); // session_id -> { caller, history }
+
+// Only answer in a language the voice can speak *now* (if Sarvam is down,
+// Tamil can't be voiced): English beats silence.
+let voiceLanguages = { list: null, checkedAt: 0 };
+// The voice's gender, from the same health check: in Hindi and other
+// languages whose verbs agree with the speaker, a woman's voice saying
+// "मैं बात कर सकता हूँ" (masculine) sounds wrong.
+let voiceGender = "";
+async function speakable() {
+  if (Date.now() - voiceLanguages.checkedAt < 15_000) return voiceLanguages.list;
+  let list = null;
+  try {
+    const res = await fetch(VOICE_HEALTH, { signal: AbortSignal.timeout(1000) });
+    const body = await res.json();
+    if (Array.isArray(body.languages)) list = body.languages;
+    if (body.voice_gender === "female" || body.voice_gender === "male") voiceGender = body.voice_gender;
+  } catch {}
+  voiceLanguages = { list, checkedAt: Date.now() };
+  return list;
+}
+
+// "ta" -> "Tamil (ta)": the model says the name aloud and still has the
+// code for its [lang:xx] tag. Saylo writes Odia "od" (Sarvam's code); ISO's is "or".
+const languageNames = new Intl.DisplayNames(["en"], { type: "language" });
+const languageName = (code) =>
+  `${code === "bn" ? "Bengali" : languageNames.of(code === "od" ? "or" : code)} (${code})`;
+
+function systemPrompt(languages) {
+  const voiced = languages ? languages.map(languageName).join(", ") : "any";
+  return `You are Saylo, a friendly voice assistant on a live phone call.
+- You're a demo with no real business data (hours, prices, bookings): if asked for those, say so kindly instead of making something up. That's the only limit: you speak every language below fluently.
+- Reply in the call's language, given as [call language: xx] on each caller line. Callers drop in English words ("okay", "thank you", "bye") in any language: that doesn't change it. Switch only when the call's language changes or the caller asks for another language. Talk the way people speak on a phone call in that language, not the way it's written: everyday spoken words, and in Indian languages the colloquial form, with the English words people really use (payment, ticket, okay). Never formal, literary or bookish language.
+- Your voice can only speak these languages: ${voiced}. Speak, translate and teach any of them whenever the caller asks. If the caller's language isn't one of them, reply in English. When you mention languages to the caller, say their names, never the codes.
+- One or two short spoken sentences. No markdown, lists or emoji. The caller only hears you: never add a transliteration, translation or pronunciation in brackets after a word, or the voice says it twice. Say each word once, in its own script.
+- Caller lines may also say [heard in: xx], the language this line was heard in.
+${voiceGender ? `- Your voice is a ${voiceGender === "female" ? "woman's" : "man's"}: wherever grammar marks the speaker's gender (Hindi, Marathi, Gujarati, Punjabi and Urdu verbs; French, Spanish and Russian adjectives), speak of yourself as a ${voiceGender === "female" ? "woman: मैं बात कर सकती हूँ, not सकता" : "man: मैं बात कर सकता हूँ, not सकती"}.\n` : ""}- Begin every reply with [lang:xx], the ISO 639-1 code of your reply's language (e.g. [lang:hi]).
+- If the caller says goodbye or wants to end the call, say a short goodbye and end with [end].`;
+}
+
+async function think(history) {
+  const languages = await speakable();
+  const reply = await ask(history, languages);
+  // Models don't always obey the language list; a reply the voice can't
+  // speak would be silence, so ask once more, for English.
+  const langOf = (r) => /^\s*\[lang:([a-z]{2,3})\]/i.exec(r.text)?.[1]?.toLowerCase();
+  const speaks = (r) => !languages || !langOf(r) || languages.includes(langOf(r));
+  if (speaks(reply)) return reply;
+  const retry = await ask([...history, { role: "system", content: "Your voice can't speak that language. Reply in English, starting with [lang:en]." }], languages);
+  if (speaks(retry)) return retry;
+  // Live, the model answered in Urdu twice, and the voice read Urdu text it
+  // can't speak as fifteen seconds of noise. Never send that to the voice.
+  console.log(`${ts()} [agent] the model kept answering in [lang:${langOf(retry)}]; saying so in English instead`);
+  return { text: "[lang:en] Sorry, I can't speak that language yet. Could we continue in English, or another language I speak?", endCall: false };
+}
+
+const GOODBYE = /\b(bye|goodbye|that's all|adi[oó]s|chao|au revoir|tsch[uü]ss|auf wiedersehen|ciao|arrivederci|tchau|do widzenia|dzi[eę]kuj[eę]|tot ziens|hej d[aå]|näkemiin|farvel|la revedere|naschledanou)\b|さようなら|じゃあね|再见|拜拜|안녕히|до свидания|до побачення|अलविदा|बाय|ठीक है धन्यवाद|போய் வருகிறேன்|பை|నమస్తే బై|বিদায়/i;
+const saysGoodbye = (text) => GOODBYE.test(text);
+
+async function ask(history, languages) {
+  if (!GROQ_KEY && !OPENAI_KEY) {
+    // No model configured: prove the pipeline works by echoing.
+    const last = history.at(-1)?.content ?? "";
+    return { text: `You said: ${last}`, endCall: /\b(bye|goodbye)\b/i.test(last) };
+  }
+  const messages = [{ role: "system", content: systemPrompt(languages) }, ...history];
+  const reply = await hedged(messages);
+  // Small models sometimes add [end] mid-conversation: hang up only when the
+  // caller's last words sound like a goodbye.
+  const endCall = /\[end\]\s*$/i.test(reply) && saysGoodbye(history.at(-1)?.content ?? "");
+  return { text: reply.replace(/\[end\]\s*$/i, "").trim(), endCall };
+}
+
+// One chat completion from an OpenAI-compatible endpoint.
+async function complete(name, url, key, model, messages, signal) {
+  const started = Date.now();
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      messages,
+      max_completion_tokens: 400,
+      ...(model.startsWith("openai/gpt-oss") ? { reasoning_effort: "low" } : {}),
+    }),
+    signal,
+  });
+  if (!res.ok) throw new Error(`${name} ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const text = (await res.json()).choices?.[0]?.message?.content?.trim() ?? "";
+  if (!text) throw new Error(`${name} returned no text`);
+  console.log(`${ts()} [llm] ${name} answered in ${Date.now() - started}ms`);
+  return text;
+}
+
+// Groq first; OpenAI if Groq fails or is slower than HEDGE_MS. First reply wins.
+function hedged(messages) {
+  const providers = [];
+  if (GROQ_KEY) providers.push(() => complete("groq", "https://api.groq.com/openai/v1/chat/completions", GROQ_KEY, MODEL, messages, abort.signal));
+  if (OPENAI_KEY) providers.push(() => complete("openai", "https://api.openai.com/v1/chat/completions", OPENAI_KEY, OPENAI_MODEL, messages, abort.signal));
+  const abort = new AbortController();
+  const timeout = setTimeout(() => abort.abort(), 8000);
+  return new Promise((resolve, reject) => {
+    let pending = 0, done = false, next = 0, timer;
+    const errors = [];
+    const launch = () => {
+      if (done || next >= providers.length) return;
+      pending++;
+      providers[next++]().then((text) => {
+        if (done) return;
+        done = true; clearTimeout(timer); clearTimeout(timeout); abort.abort();
+        resolve(text);
+      }, (err) => {
+        errors.push(err.message || String(err));
+        if (done) return;
+        if (--pending === 0 && next >= providers.length) { done = true; clearTimeout(timer); clearTimeout(timeout); reject(new Error(errors.join("; "))); }
+        else { clearTimeout(timer); launch(); }
+      });
+      if (next < providers.length) timer = setTimeout(launch, HEDGE_MS);
+    };
+    launch();
+  });
+}
+
+// The [lang:xx] tag tells the voice router which voice to use; the page and
+// Saylo's transcripts show the words without it.
+// What the page shows: no routing tags anywhere ("…ಬೇಕು?[lang:kn] ಇನ್ನೇನು…"),
+// and no brackets without a word in them ("[??]").
+const untagged = (text) =>
+  text.replace(/\[(lang|voice):[^\]]*\]/gi, " ").replace(/\[[^\p{L}\p{N}\]]{0,16}\]/gu, " ").replace(/\s{2,}/g, " ").trim();
+
+async function handleAgent(req) {
+  const call = sessions.get(req.session_id) ?? {
+    caller: callers.get(req.resource_id ?? "") ?? { name: "there", language: "", region: "" },
+    history: [],
+    turn: 0, // the latest chat turn: a reply to an older one is never stored
+  };
+  sessions.set(req.session_id, call);
+
+  switch (req.type) {
+    case "listen":
+      return { language: call.caller.language || undefined, region: call.caller.region || undefined };
+    case "greeting": {
+      const text = `Hi ${call.caller.name}, this is Saylo. How can I help you today?`;
+      call.history.push({ role: "assistant", content: text });
+      publish({ kind: "agent", text });
+      return { text };
+    }
+    case "chat": {
+      const said = (req.text ?? "").trim();
+      if (!said) return { text: "" };
+      const turn = ++call.turn;
+      if (req.replaces_last_turn) {
+        // The caller paused mid-sentence and went on: this turn is the whole
+        // sentence. Forget the first part and the reply nobody heard.
+        const i = call.history.findLastIndex((m) => m.role === "user");
+        if (i >= 0) call.history.splice(i);
+        console.log(`${ts()} [agent] the caller went on after a pause; answering the whole sentence`);
+      }
+      publish({ kind: "caller", text: said, language: req.language });
+      if (req.interrupted_text) {
+        // The caller cut the last reply off: remember only what they heard.
+        console.log(`${ts()} [agent] caller interrupted; Saylo says they heard: ${JSON.stringify(req.interrupted_text)}`);
+        const last = call.history.at(-1);
+        if (last?.role === "assistant") last.content = `${req.interrupted_text} [the caller cut in here]`;
+      }
+      // Saylo says which language the call is in (language: it doesn't
+      // move on "okay" or "thank you") and which this line was heard in.
+      // Live, "Okay" in a Kannada call got an English reply.
+      const tags = [];
+      if (req.language) tags.push(`[call language: ${req.language}]`);
+      if (req.heard_language && req.heard_language !== req.language) tags.push(`[heard in: ${req.heard_language}]`);
+      call.history.push({ role: "user", content: tags.length ? `${tags.join(" ")} ${said}` : said });
+      let reply;
+      try {
+        reply = await think(call.history);
+      } catch (err) {
+        console.error(`${ts()} [agent] ${err}`);
+        reply = { text: "Sorry, I had trouble with that. Could you say it again?", endCall: false };
+      }
+      // Models sometimes add [end] to a first reply; a call isn't over before
+      // the caller has said more than one thing.
+      if (call.history.filter((m) => m.role === "user").length < 2) reply.endCall = false;
+      // A newer turn arrived while this one was thinking (Saylo cancelled this
+      // request): the caller will never hear this reply.
+      if (turn !== call.turn) return { text: "" };
+      call.history.push({ role: "assistant", content: reply.text });
+      publish({ kind: "agent", text: untagged(reply.text), endCall: reply.endCall });
+      return { text: reply.text, ...(reply.endCall ? { end_call: true } : {}) };
+    }
+    default: // "oneshot": Saylo's own background summaries
+      return { text: "" };
+  }
+}
+
+createServer(async (req, res) => {
+  if (req.method !== "POST") return res.writeHead(404).end();
+  if (AGENT_KEY && req.headers.authorization !== `Bearer ${AGENT_KEY}`) {
+    return res.writeHead(401, { "Content-Type": "application/json" }).end('{"error":"unauthorized"}');
+  }
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  try {
+    const out = await handleAgent(JSON.parse(body));
+    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(out));
+  } catch (err) {
+    console.error(`${ts()} [agent] ${err}`);
+    res.writeHead(500, { "Content-Type": "application/json" }).end('{"error":"internal"}');
+  }
+}).listen(AGENT_PORT, () => console.log(`${ts()} demo agent on :${AGENT_PORT}${GROQ_KEY || OPENAI_KEY ? ` (${[GROQ_KEY && `Groq ${MODEL}`, OPENAI_KEY && `OpenAI ${OPENAI_MODEL}${GROQ_KEY ? ` after ${HEDGE_MS}ms` : ""}`].filter(Boolean).join(", then ")})` : " (echo mode: set GROQ_API_KEY or OPENAI_API_KEY for real replies)"}`));
+
+// --- the page, and WHIP forwarded to Saylo with the caller's identity ---------
+async function forwardWhip(req, res) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const headers = { "X-StreamCore-Resource-Id": currentResource };
+  for (const h of ["content-type", "if-match"]) {
+    if (typeof req.headers[h] === "string") headers[h] = req.headers[h];
+  }
+  const upstream = await fetch(`${SAYLO}${req.url}`, {
+    method: req.method,
+    headers,
+    body: chunks.length ? Buffer.concat(chunks) : undefined,
+  });
+  const out = {};
+  for (const h of ["content-type", "etag", "accept-patch", "x-resume-token"]) {
+    const v = upstream.headers.get(h);
+    if (v) out[h] = v;
+  }
+  const location = upstream.headers.get("location");
+  if (location) out["location"] = new URL(location, SAYLO).pathname;
+  res.writeHead(upstream.status, out).end(Buffer.from(await upstream.arrayBuffer()));
+}
+
+createServer(async (req, res) => {
+  const url = req.url ?? "/";
+  if (req.method === "GET" && url === "/") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(page);
+  } else if (req.method === "GET" && url === "/api/events") {
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+    res.write(": connected\n\n");
+    feeds.add(res);
+    req.on("close", () => feeds.delete(res));
+  } else if (req.method === "POST" && url === "/api/call") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    let caller = {};
+    try {
+      caller = JSON.parse(body);
+    } catch {}
+    callNo += 1;
+    // A fresh identity per call, so a new call never picks up an old one's state.
+    currentResource = `caller-${Date.now()}-${callNo}`;
+    callers.set(currentResource, {
+      name: String(caller.name || "there").slice(0, 60),
+      language: String(caller.language || "").slice(0, 10),
+      region: caller.region === "IN" ? "IN" : "",
+    });
+    console.log(`${ts()} [call] ${currentResource} ${JSON.stringify(callers.get(currentResource))}`);
+    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ id: currentResource }));
+  } else if (url.startsWith("/whip")) {
+    forwardWhip(req, res).catch((err) => {
+      console.error(`${ts()} [whip] ${err}`);
+      res.writeHead(502, { "Content-Type": "text/plain" }).end(`Saylo server unreachable at ${SAYLO}: ${err}`);
+    });
+  } else {
+    res.writeHead(404).end();
+  }
+}).listen(PAGE_PORT, () => console.log(`${ts()} open http://localhost:${PAGE_PORT} to talk to Saylo`));

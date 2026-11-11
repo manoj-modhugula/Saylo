@@ -1,0 +1,601 @@
+package config
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"sort"
+	"strings"
+	"testing"
+)
+
+var (
+	exampleSectionPattern = regexp.MustCompile(`^\s*#?\s*\[([A-Za-z0-9_.-]+)\]\s*(?:#.*)?$`)
+	exampleKeyPattern     = regexp.MustCompile(`^\s*#?\s*([A-Za-z0-9_]+)\s*=`)
+)
+
+func configPaths(typ reflect.Type, prefix string) []string {
+	var paths []string
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		name := field.Tag.Get("toml")
+		if name == "" || name == "-" {
+			continue
+		}
+		path := name
+		if prefix != "" {
+			path = prefix + "." + name
+		}
+		if field.Type.Kind() == reflect.Struct {
+			paths = append(paths, configPaths(field.Type, path)...)
+			continue
+		}
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+func documentedConfigPaths(t *testing.T, path string) map[string]struct{} {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open config example: %v", err)
+	}
+	defer file.Close()
+
+	documented := make(map[string]struct{})
+	section := ""
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if match := exampleSectionPattern.FindStringSubmatch(line); match != nil {
+			section = match[1]
+			continue
+		}
+		if section == "" {
+			continue
+		}
+		if match := exampleKeyPattern.FindStringSubmatch(line); match != nil {
+			documented[section+"."+match[1]] = struct{}{}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("read config example: %v", err)
+	}
+	return documented
+}
+
+func TestConfigExampleDocumentsEveryField(t *testing.T) {
+	documented := documentedConfigPaths(t, filepath.Join("..", "..", "config.toml.example"))
+	var missing []string
+	for _, path := range configPaths(reflect.TypeOf(Config{}), "") {
+		if _, ok := documented[path]; !ok {
+			missing = append(missing, path)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Fatalf("config.toml.example does not document: %s", strings.Join(missing, ", "))
+	}
+}
+
+// Every credential must be settable from the environment, with no exceptions —
+// a provider you can only configure through the file is one you cannot deploy
+// in a container without baking the secret into an image.
+func TestEveryCredentialHasAnEnvOverride(t *testing.T) {
+	covered := make(map[string]struct{}, len(envOverrides))
+	cfg := &Config{}
+	for _, o := range envOverrides {
+		covered[fmt.Sprintf("%p", o.field(cfg))] = struct{}{}
+	}
+
+	var missing []string
+	for _, path := range configPaths(reflect.TypeOf(Config{}), "") {
+		name := path[strings.LastIndex(path, ".")+1:]
+		if name != "api_key" && name != "connection_string" {
+			continue
+		}
+		if _, ok := covered[fmt.Sprintf("%p", fieldByTOMLPath(cfg, path))]; !ok {
+			missing = append(missing, path)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Fatalf("no environment override for: %s", strings.Join(missing, ", "))
+	}
+}
+
+// fieldByTOMLPath resolves a dotted path of TOML tags to the string field it
+// names, so the test can compare against the pointers envOverrides hands out.
+func fieldByTOMLPath(cfg *Config, path string) *string {
+	value := reflect.ValueOf(cfg).Elem()
+	for segment := range strings.SplitSeq(path, ".") {
+		found := false
+		for i := 0; i < value.NumField(); i++ {
+			if value.Type().Field(i).Tag.Get("toml") == segment {
+				value = value.Field(i)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+	}
+	if value.Kind() != reflect.String {
+		return nil
+	}
+	return value.Addr().Interface().(*string)
+}
+
+// writeConfig writes a TOML file and returns its path.
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var output bytes.Buffer
+	originalOutput := log.Writer()
+	originalFlags := log.Flags()
+	originalPrefix := log.Prefix()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(originalOutput)
+		log.SetFlags(originalFlags)
+		log.SetPrefix(originalPrefix)
+	})
+	return &output
+}
+
+// clearEnvOverrides makes a test hermetic against secrets exported in the
+// developer's shell, which Load would otherwise pick up and log.
+func clearEnvOverrides(t *testing.T) {
+	t.Helper()
+	for _, o := range envOverrides {
+		t.Setenv(o.env, "")
+	}
+}
+
+func TestLoadReadsSecretsFromEnvironment(t *testing.T) {
+	clearEnvOverrides(t)
+	logs := captureLogs(t)
+	path := writeConfig(t, `
+[openai]
+api_key = "file-key"
+`)
+	// One variable overriding a file value, one filling a key the file never
+	// had — both are the container deployment case this exists for.
+	t.Setenv("OPENAI_API_KEY", "env-key")
+	t.Setenv("STREAMCORE_JWT_SECRET", "env-jwt")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OpenAI.APIKey != "env-key" {
+		t.Errorf("OpenAI.APIKey = %q, want the environment to win over the file", cfg.OpenAI.APIKey)
+	}
+	if cfg.Server.JWTSecret != "env-jwt" {
+		t.Errorf("Server.JWTSecret = %q, want the environment value", cfg.Server.JWTSecret)
+	}
+	// The override is announced by name so an unexpected key source is
+	// visible — but the value itself must never reach the log.
+	if got := logs.String(); !strings.Contains(got, "OPENAI_API_KEY") {
+		t.Errorf("override was not logged: %q", got)
+	}
+	if got := logs.String(); strings.Contains(got, "env-key") || strings.Contains(got, "env-jwt") {
+		t.Errorf("a secret value leaked into the log: %q", got)
+	}
+}
+
+func TestLoadIgnoresEmptyEnvOverrides(t *testing.T) {
+	clearEnvOverrides(t)
+	path := writeConfig(t, `
+[openai]
+api_key = "file-key"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OpenAI.APIKey != "file-key" {
+		t.Errorf("OpenAI.APIKey = %q, want the file value when the variable is unset", cfg.OpenAI.APIKey)
+	}
+}
+
+func TestLoadOpenAISTTModel(t *testing.T) {
+	clearEnvOverrides(t)
+
+	t.Run("defaults to whisper-1", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, ""))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.OpenAI.STTModel != "whisper-1" {
+			t.Errorf("OpenAI.STTModel = %q, want %q", cfg.OpenAI.STTModel, "whisper-1")
+		}
+	})
+
+	t.Run("reads an explicit transcription model", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, `
+[openai]
+stt_model = "gpt-4o-transcribe"
+`))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.OpenAI.STTModel != "gpt-4o-transcribe" {
+			t.Errorf("OpenAI.STTModel = %q, want %q", cfg.OpenAI.STTModel, "gpt-4o-transcribe")
+		}
+	})
+}
+
+func TestLoadWarnsAboutUnknownKeys(t *testing.T) {
+	clearEnvOverrides(t)
+	logs := captureLogs(t)
+	path := writeConfig(t, `
+[pipeline]
+unknown_option = true
+
+[cartesia]
+api_ke = "test-key"
+`)
+
+	if _, err := Load(path); err != nil {
+		t.Fatalf("config with unknown keys rejected: %v", err)
+	}
+	const want = "Warning: unknown config key(s): cartesia.api_ke, pipeline.unknown_option — check for a typo"
+	if got := strings.TrimSpace(logs.String()); got != want {
+		t.Fatalf("warning = %q, want %q", got, want)
+	}
+}
+
+func TestLoadDoesNotWarnAboutKnownKeys(t *testing.T) {
+	clearEnvOverrides(t)
+	logs := captureLogs(t)
+	path := writeConfig(t, `
+[pipeline]
+barge_in = true
+
+[cartesia]
+api_key = "test-key"
+`)
+
+	if _, err := Load(path); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
+	}
+	if got := logs.String(); got != "" {
+		t.Fatalf("valid config logged an unexpected warning: %q", got)
+	}
+}
+
+// Defaults must be applied before validation runs, or a config that simply
+// omits reasoning_effort would be rejected for having an empty value.
+func TestLoadAppliesDefaultsBeforeValidating(t *testing.T) {
+	path := writeConfig(t, `
+[realtime]
+provider = "grok"
+
+[grok]
+api_key = "xai-test"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("minimal realtime config rejected: %v", err)
+	}
+	if cfg.Grok.ReasoningEffort != "high" {
+		t.Errorf("reasoning_effort = %q, want the default \"high\"", cfg.Grok.ReasoningEffort)
+	}
+	if cfg.Grok.Model == "" {
+		t.Error("model default not applied")
+	}
+	if cfg.Grok.Transcription == nil || !*cfg.Grok.Transcription {
+		t.Error("transcription should default to enabled")
+	}
+	if !cfg.RealtimeEnabled() {
+		t.Error("RealtimeEnabled() false for a configured realtime provider")
+	}
+}
+
+func TestLoadRejectsBadRealtimeConfig(t *testing.T) {
+	path := writeConfig(t, `
+[realtime]
+provider = "grock"
+
+[grok]
+api_key = "xai-test"
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Error("Load accepted a typo'd realtime provider")
+	}
+}
+
+// A classic deployment must keep loading with no realtime section present.
+func TestLoadClassicConfigUnaffected(t *testing.T) {
+	path := writeConfig(t, `
+[stt]
+provider = "deepgram"
+
+[llm]
+provider = "openai"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("classic config rejected: %v", err)
+	}
+	if cfg.RealtimeEnabled() {
+		t.Error("RealtimeEnabled() true with no [realtime] section")
+	}
+}
+
+func realtimeConfig() *Config {
+	cfg := &Config{}
+	cfg.Realtime.Provider = "grok"
+	cfg.Grok.APIKey = "xai-test"
+	cfg.Grok.ReasoningEffort = "high"
+	return cfg
+}
+
+func TestRealtimeEnabled(t *testing.T) {
+	cases := []struct {
+		provider string
+		want     bool
+	}{
+		{"", false},
+		{"none", false},
+		{"grok", true},
+	}
+	for _, tc := range cases {
+		cfg := &Config{}
+		cfg.Realtime.Provider = tc.provider
+		if got := cfg.RealtimeEnabled(); got != tc.want {
+			t.Errorf("RealtimeEnabled() with provider %q = %v, want %v", tc.provider, got, tc.want)
+		}
+	}
+}
+
+func TestValidateRealtimeAcceptsValidConfig(t *testing.T) {
+	if err := realtimeConfig().validateRealtime(); err != nil {
+		t.Errorf("valid realtime config rejected: %v", err)
+	}
+}
+
+// A disabled realtime section must not be validated at all, or every classic
+// deployment would need Grok settings it has no use for.
+func TestValidateRealtimeSkippedWhenDisabled(t *testing.T) {
+	cfg := &Config{}
+	if err := cfg.validateRealtime(); err != nil {
+		t.Errorf("validation ran on a disabled realtime section: %v", err)
+	}
+}
+
+func TestValidateRealtimeRejectsUnknownProvider(t *testing.T) {
+	cfg := realtimeConfig()
+	cfg.Realtime.Provider = "grock" // plausible typo
+
+	if err := cfg.validateRealtime(); err == nil {
+		t.Error("a typo'd provider was accepted; it would only fail on the first call")
+	}
+}
+
+func TestValidateRealtimeRequiresAPIKey(t *testing.T) {
+	cfg := realtimeConfig()
+	cfg.Grok.APIKey = ""
+
+	if err := cfg.validateRealtime(); err == nil {
+		t.Error("missing [grok] api_key was accepted")
+	}
+}
+
+func TestValidateRealtimeRejectsBadReasoningEffort(t *testing.T) {
+	cfg := realtimeConfig()
+	cfg.Grok.ReasoningEffort = "medium" // valid for chat models, not for voice
+
+	if err := cfg.validateRealtime(); err == nil {
+		t.Error("reasoning_effort = \"medium\" was accepted; only high/none are valid")
+	}
+}
+
+// Out-of-range tunables are rejected by the provider mid-call, so they have to
+// be caught at startup instead.
+func TestValidateRealtimeRejectsOutOfRangeTunables(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"vad_threshold too low", func(c *Config) { c.Grok.VADThreshold = 0.05 }},
+		{"vad_threshold too high", func(c *Config) { c.Grok.VADThreshold = 0.95 }},
+		{"silence_duration_ms negative", func(c *Config) { c.Grok.SilenceDurationMs = -1 }},
+		{"silence_duration_ms too high", func(c *Config) { c.Grok.SilenceDurationMs = 10001 }},
+		{"prefix_padding_ms negative", func(c *Config) { c.Grok.PrefixPaddingMs = -1 }},
+		{"prefix_padding_ms too high", func(c *Config) { c.Grok.PrefixPaddingMs = 10001 }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := realtimeConfig()
+			tc.mutate(cfg)
+			if err := cfg.validateRealtime(); err == nil {
+				t.Errorf("%s was accepted", tc.name)
+			}
+		})
+	}
+}
+
+// Zero means "leave the provider default", so it must not trip the range check.
+func TestValidateRealtimeAllowsUnsetTunables(t *testing.T) {
+	cfg := realtimeConfig()
+	cfg.Grok.VADThreshold = 0
+	cfg.Grok.SilenceDurationMs = 0
+	cfg.Grok.PrefixPaddingMs = 0
+
+	if err := cfg.validateRealtime(); err != nil {
+		t.Errorf("unset tunables rejected: %v", err)
+	}
+}
+
+func TestValidateRealtimeRejectsTooManyKeyterms(t *testing.T) {
+	cfg := realtimeConfig()
+	cfg.Grok.Keyterms = make([]string, 101)
+
+	if err := cfg.validateRealtime(); err == nil {
+		t.Error("101 keyterms accepted; the documented maximum is 100")
+	}
+}
+
+// The developer integrations are off unless the operator turns them on, and
+// when they are on the credentials they need are checked at startup rather than
+// mid-call.
+func TestDeveloperToolsDefaultOff(t *testing.T) {
+	cfg := &Config{}
+	if cfg.GitHub.Enabled || cfg.Codex.Enabled {
+		t.Fatal("a developer integration is enabled by default")
+	}
+	if err := cfg.validateDeveloperTools(); err != nil {
+		t.Fatalf("a config with both disabled was rejected: %v", err)
+	}
+}
+
+func TestGitHubConfigRequiresACredential(t *testing.T) {
+	base := func() *Config {
+		cfg := &Config{}
+		cfg.GitHub = GitHubConfig{
+			Enabled:        true,
+			AppID:          "Iv1.abc",
+			InstallationID: "12345",
+			PrivateKeyPath: "/run/secrets/app.pem",
+			Repositories:   []string{"streamcoreai/streamcore-server"},
+		}
+		return cfg
+	}
+	if err := base().validateDeveloperTools(); err != nil {
+		t.Fatalf("a complete github config was rejected: %v", err)
+	}
+
+	for name, breakIt := range map[string]func(*Config){
+		"app_id":           func(c *Config) { c.GitHub.AppID = "" },
+		"installation_id":  func(c *Config) { c.GitHub.InstallationID = "" },
+		"private_key_path": func(c *Config) { c.GitHub.PrivateKeyPath = "" },
+		"repositories":     func(c *Config) { c.GitHub.Repositories = nil },
+		"malformed repo":   func(c *Config) { c.GitHub.Repositories = []string{"not-a-repo"} },
+	} {
+		cfg := base()
+		breakIt(cfg)
+		if err := cfg.validateDeveloperTools(); err == nil {
+			t.Fatalf("a github config missing %s was accepted", name)
+		}
+	}
+}
+
+func TestCodexConfigNeedsAWorkspace(t *testing.T) {
+	cfg := &Config{}
+	cfg.Codex = CodexConfig{Enabled: true}
+	if err := cfg.validateDeveloperTools(); err == nil {
+		t.Fatal("codex was enabled with nowhere to work")
+	}
+
+	cfg.Codex.WorkspaceRoot = "/var/lib/streamcore/codex"
+	if err := cfg.validateDeveloperTools(); err != nil {
+		t.Fatalf("a valid codex config was rejected: %v", err)
+	}
+}
+
+// There is intentionally no way to give Codex an API key through config: the
+// integration exists to spend the operator's ChatGPT subscription.
+func TestCodexConfigHasNoAPIKey(t *testing.T) {
+	value := reflect.TypeOf(CodexConfig{})
+	for i := range value.NumField() {
+		name := strings.ToLower(value.Field(i).Name)
+		if strings.Contains(name, "apikey") || strings.Contains(name, "token") || strings.Contains(name, "secret") {
+			t.Fatalf("[codex] exposes a credential field: %s", value.Field(i).Name)
+		}
+	}
+}
+
+// A single instance commonly serves browsers and SIP calls at once, so the
+// echo bound has to be decided per peer rather than per server.
+func TestEchoGuardFor(t *testing.T) {
+	cases := []struct {
+		mode      string
+		aecAbsent bool
+		want      bool
+	}{
+		{EchoGuardAuto, true, true},    // SIP leg declares aec=none
+		{EchoGuardAuto, false, false},  // browser, AEC ran in getUserMedia
+		{EchoGuardAlways, false, true}, // client that cannot send the hint
+		{EchoGuardAlways, true, true},
+		{EchoGuardOff, true, false},
+		{EchoGuardOff, false, false},
+	}
+	for _, c := range cases {
+		cfg := &Config{}
+		cfg.Pipeline.EchoGuard = c.mode
+		if got := cfg.EchoGuardFor(c.aecAbsent); got != c.want {
+			t.Errorf("mode %q aecAbsent=%v: got %v, want %v", c.mode, c.aecAbsent, got, c.want)
+		}
+	}
+}
+
+// An unset echo_guard must behave as "auto", so an upgrade fixes SIP without
+// touching browser sessions and without anyone editing a config.
+func TestEchoGuardDefaultsToAuto(t *testing.T) {
+	cfg := &Config{}
+	if cfg.EchoGuardFor(true) {
+		t.Error("zero-value config must not enable the guard before defaults are applied")
+	}
+	cfg.Pipeline.EchoGuard = EchoGuardAuto
+	if !cfg.EchoGuardFor(true) || cfg.EchoGuardFor(false) {
+		t.Error("auto must follow the peer's aec hint")
+	}
+}
+
+func TestEchoGuardRejectsUnknownMode(t *testing.T) {
+	cfg := &Config{}
+	cfg.Pipeline.EchoGuard = "yes"
+	if err := cfg.validateEchoGuard(); err == nil {
+		t.Error("expected an error for an unknown echo_guard mode")
+	}
+}
+
+func TestLoadDefaultsEchoGuardToAuto(t *testing.T) {
+	path := writeConfig(t, "[pipeline]\nbarge_in = true\n")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("config rejected: %v", err)
+	}
+	if cfg.Pipeline.EchoGuard != EchoGuardAuto {
+		t.Errorf("echo_guard = %q, want the default %q", cfg.Pipeline.EchoGuard, EchoGuardAuto)
+	}
+	if !cfg.EchoGuardFor(true) {
+		t.Error("a SIP peer declaring aec=none should get the guard by default")
+	}
+	if cfg.EchoGuardFor(false) {
+		t.Error("a browser peer must not get the guard by default")
+	}
+}
+
+func TestLoadRejectsBadEchoGuardMode(t *testing.T) {
+	path := writeConfig(t, "[pipeline]\necho_guard = \"on\"\n")
+
+	if _, err := Load(path); err == nil {
+		t.Error("Load accepted an unknown echo_guard mode")
+	}
+}

@@ -1,0 +1,371 @@
+package stt
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/streamcoreai/streamcore-server/internal/config"
+
+	clientinterfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
+	websocketv1 "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/listen/v1/websocket"
+
+	msginterfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
+)
+
+// recentFinalSuppressWindow is how long an identical final transcript is
+// suppressed after being emitted. Deepgram can re-deliver the same text via
+// both speech_final and UtteranceEnd; emitting twice would make the agent
+// answer the same sentence twice.
+const recentFinalSuppressWindow = 5 * time.Second
+
+// stableFinalAfter: words Deepgram keeps re-sending unchanged for this long
+// are a finished sentence. On a line with any background noise (live: a
+// -60 dB hiss) Deepgram's endpointing often never fires; it repeats the same
+// interim words about once a second and the sentence ends only on
+// UtteranceEnd, 2-5 s after the caller stopped. A pause mid-sentence that
+// this ends early is joined back by the turn buffer.
+const stableFinalAfter = 700 * time.Millisecond
+
+// deepgramCallback implements the Deepgram SDK's LiveMessageCallback interface.
+//
+// Deepgram delivers an utterance as a series of chunks: interim results, then
+// one or more is_final chunks, and finally (usually) one carrying
+// speech_final. Emitting each is_final chunk separately splits a single
+// sentence into several turns, and consecutive chunks routinely overlap by a
+// few words. This callback accumulates the chunks, merges the overlaps, and
+// emits exactly one final per utterance.
+type deepgramCallback struct {
+	onResult func(TranscriptResult)
+	mu       sync.Mutex
+	// finalized accumulates is_final chunks for the current utterance.
+	finalized          string
+	lastEmittedPartial string
+	lastFinal          string
+	lastFinalAt        time.Time
+	speechActive       bool
+	// lastChunkConfidence remembers the confidence from the most recent
+	// message of this utterance, so the UtteranceEnd flush path — which has
+	// no message of its own — can still report one.
+	lastChunkConfidence float64
+	// lastLanguage is the language multi mode reported for this utterance.
+	lastLanguage string
+
+	// The utterance's words so far and when they last changed; see
+	// stableFinalAfter.
+	current   string
+	changedAt time.Time
+	// sent is how many of the utterance's words have already gone out as
+	// finals, ended early (stableFinalAfter).
+	// Deepgram's own transcript of the utterance is left as it is; every
+	// final sends only the words past this count, so none goes out twice.
+	// An earlier version reset the transcript on an early final instead, and
+	// Deepgram's later chunks then repeated whole sentences.
+	sent int
+	now  func() time.Time // for tests
+}
+
+func (cb *deepgramCallback) clock() time.Time {
+	if cb.now != nil {
+		return cb.now()
+	}
+	return time.Now()
+}
+
+// stableLocked reports whether text is unchanged for stableFinalAfter.
+func (cb *deepgramCallback) stableLocked(text string) bool {
+	now := cb.clock()
+	if !sameTranscript(text, cb.current) {
+		cb.current, cb.changedAt = text, now
+		return false
+	}
+	return now.Sub(cb.changedAt) >= stableFinalAfter
+}
+
+// unsentLocked is text without the words already sent as finals.
+func (cb *deepgramCallback) unsentLocked(text string) string {
+	words := strings.Fields(text)
+	if cb.sent >= len(words) {
+		return ""
+	}
+	return strings.Join(words[cb.sent:], " ")
+}
+
+func (cb *deepgramCallback) Open(or *msginterfaces.OpenResponse) error {
+	log.Println("[stt] Deepgram connection opened")
+	return nil
+}
+
+func (cb *deepgramCallback) Message(mr *msginterfaces.MessageResponse) error {
+	if len(mr.Channel.Alternatives) == 0 {
+		return nil
+	}
+
+	alt := mr.Channel.Alternatives[0]
+	text := strings.TrimSpace(alt.Transcript)
+	// The end of the utterance can come on a message with no new words:
+	// speech_final after the words were already final.
+	endsUtterance := mr.IsFinal && mr.SpeechFinal
+	if text == "" {
+		if endsUtterance {
+			cb.flushUtterance()
+		}
+		return nil
+	}
+	confidence := alt.Confidence
+	language := ""
+	if len(alt.Languages) > 0 {
+		language = alt.Languages[0]
+	}
+
+	var emit *TranscriptResult
+
+	cb.mu.Lock()
+	cb.lastChunkConfidence = confidence
+	if language != "" {
+		cb.lastLanguage = language
+	}
+	if mr.IsFinal {
+		cb.finalized = mergeTranscriptChunks(cb.finalized, text)
+		if endsUtterance {
+			combined := strings.TrimSpace(cb.finalized)
+			if combined == "" {
+				combined = text
+			}
+			rest := cb.unsentLocked(combined)
+			if rest != "" && !cb.shouldSuppressRecentFinalLocked(rest) {
+				emit = &TranscriptResult{Text: rest, IsFinal: true, Confidence: confidence, Language: cb.lastLanguage}
+			}
+			cb.resetUtteranceLocked(rest)
+		} else if cb.stableLocked(cb.finalized) {
+			emit = cb.earlyFinalLocked(cb.finalized, confidence)
+		} else {
+			// Emit progress so barge-in and the text UI still see current words.
+			emit = cb.partialResultLocked(cb.unsentLocked(cb.finalized), confidence)
+		}
+	} else {
+		combined := text
+		if cb.finalized != "" {
+			combined = strings.TrimSpace(cb.finalized + " " + text)
+		}
+		if cb.stableLocked(combined) {
+			emit = cb.earlyFinalLocked(combined, confidence)
+		} else {
+			emit = cb.partialResultLocked(cb.unsentLocked(combined), confidence)
+		}
+	}
+	cb.mu.Unlock()
+
+	if emit != nil {
+		if emit.IsFinal {
+			log.Printf("[stt] final: %q (conf=%.2f lang=%s)", emit.Text, emit.Confidence, emit.Language)
+		}
+		cb.onResult(*emit)
+	}
+	return nil
+}
+
+// earlyFinalLocked sends the utterance's unsent words as a final, without
+// ending Deepgram's utterance: its later chunks add only what's new.
+func (cb *deepgramCallback) earlyFinalLocked(full string, confidence float64) *TranscriptResult {
+	rest := cb.unsentLocked(full)
+	if rest == "" {
+		return nil
+	}
+	cb.sent = len(strings.Fields(full))
+	cb.lastEmittedPartial = ""
+	cb.lastFinal, cb.lastFinalAt = rest, cb.clock()
+	return &TranscriptResult{Text: rest, IsFinal: true, Confidence: confidence, Language: cb.lastLanguage}
+}
+
+// partialResultLocked builds an interim result, dropping repeats and anything
+// that merely restates a final we just emitted.
+func (cb *deepgramCallback) partialResultLocked(text string, confidence float64) *TranscriptResult {
+	text = strings.TrimSpace(text)
+	if text == "" ||
+		sameTranscript(text, cb.lastEmittedPartial) ||
+		cb.shouldSuppressRecentFinalLocked(text) {
+		return nil
+	}
+	cb.lastEmittedPartial = text
+	return &TranscriptResult{Text: text, IsFinal: false, Confidence: confidence}
+}
+
+// resetUtteranceLocked clears per-utterance accumulation and records the final
+// text so an immediate repeat can be suppressed.
+func (cb *deepgramCallback) resetUtteranceLocked(finalText string) {
+	cb.finalized = ""
+	cb.lastEmittedPartial = ""
+	cb.speechActive = false
+	cb.lastChunkConfidence = 0
+	cb.lastLanguage = ""
+	cb.current, cb.changedAt = "", time.Time{}
+	cb.sent = 0
+	if strings.TrimSpace(finalText) != "" {
+		cb.lastFinal = finalText
+		cb.lastFinalAt = cb.clock()
+	}
+}
+
+func (cb *deepgramCallback) shouldSuppressRecentFinalLocked(text string) bool {
+	return sameTranscript(text, cb.lastFinal) && cb.clock().Sub(cb.lastFinalAt) < recentFinalSuppressWindow
+}
+
+func (cb *deepgramCallback) Metadata(md *msginterfaces.MetadataResponse) error {
+	return nil
+}
+
+func (cb *deepgramCallback) SpeechStarted(ssr *msginterfaces.SpeechStartedResponse) error {
+	var logStarted bool
+	cb.mu.Lock()
+	if !cb.speechActive {
+		cb.speechActive = true
+		logStarted = true
+	}
+	cb.mu.Unlock()
+	if logStarted {
+		log.Println("[stt] Deepgram speech started")
+	}
+	return nil
+}
+
+// UtteranceEnd is the fallback path: if Deepgram closes the utterance without
+// ever sending a speech_final message, the buffered chunks would otherwise sit
+// in `finalized` forever and the caller's turn would be silently dropped.
+func (cb *deepgramCallback) UtteranceEnd(ur *msginterfaces.UtteranceEndResponse) error {
+	cb.flushUtterance()
+	return nil
+}
+
+// flushUtterance ends the utterance on the words already final.
+func (cb *deepgramCallback) flushUtterance() {
+	cb.mu.Lock()
+	combined := cb.unsentLocked(strings.TrimSpace(cb.finalized))
+	emit := combined != "" && !cb.shouldSuppressRecentFinalLocked(combined)
+	confidence := cb.lastChunkConfidence
+	language := cb.lastLanguage
+	cb.resetUtteranceLocked(combined)
+	cb.mu.Unlock()
+
+	if emit {
+		log.Printf("[stt] utterance end flush: %q (conf=%.2f)", combined, confidence)
+		cb.onResult(TranscriptResult{Text: combined, IsFinal: true, Confidence: confidence, Language: language})
+	}
+}
+
+func (cb *deepgramCallback) Close(cr *msginterfaces.CloseResponse) error {
+	log.Println("[stt] Deepgram connection closed")
+	return nil
+}
+
+func (cb *deepgramCallback) Error(er *msginterfaces.ErrorResponse) error {
+	log.Printf("[stt] Deepgram error: %s", er.ErrMsg)
+	return nil
+}
+
+func (cb *deepgramCallback) UnhandledEvent(byData []byte) error {
+	return nil
+}
+
+// deepgramClient wraps the official Deepgram Go SDK websocket client.
+type deepgramClient struct {
+	ws     *websocketv1.WSCallback
+	cancel context.CancelFunc
+}
+
+func NewDeepgramClient(ctx context.Context, cfg config.DeepgramConfig, onResult func(TranscriptResult)) (*deepgramClient, error) {
+	sttCtx, cancel := context.WithCancel(ctx)
+
+	tOptions := &clientinterfaces.LiveTranscriptionOptions{
+		Model:          cfg.Model,
+		Language:       nova3Language(cfg.Language),
+		Encoding:       "linear16",
+		SampleRate:     16000,
+		Channels:       1,
+		Punctuate:      true,
+		InterimResults: true,
+		Endpointing:    cfg.Endpointing,
+		// UtteranceEndMs drives the UtteranceEnd event the callback uses to
+		// flush buffered chunks when speech_final never arrives.
+		UtteranceEndMs: cfg.UtteranceEndMs,
+		VadEvents:      true,
+		// Keyterms bias the decoder toward domain vocabulary that is
+		// phonetically ambiguous against common English. Nova-3 only; the SDK
+		// silently drops them on other models.
+		Keyterm: cfg.Keyterms,
+	}
+	if len(cfg.Keyterms) > 0 {
+		log.Printf("[stt] deepgram keyterms loaded: count=%d", len(cfg.Keyterms))
+	}
+
+	cb := &deepgramCallback{onResult: onResult}
+
+	// KeepAlive while no audio flows: Deepgram closes a stream that gets
+	// nothing for ~10 s (close 1011). Live, a browser that sent no packets
+	// during pure-digital silence lost the connection, and the caller's next
+	// sentence with it.
+	ws, err := websocketv1.NewUsingCallbackWithCancel(sttCtx, cancel, cfg.APIKey, &clientinterfaces.ClientOptions{EnableKeepAlive: true}, tOptions, cb)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("deepgram client: %w", err)
+	}
+
+	if !ws.Connect() {
+		cancel()
+		return nil, fmt.Errorf("deepgram: failed to connect")
+	}
+
+	log.Println("[stt] connected to Deepgram")
+	return &deepgramClient{ws: ws, cancel: cancel}, nil
+}
+
+// nova3Language maps a BCP-47 locale to the language code Nova-3 accepts.
+// Languages Nova-3 recognises on their own are passed through; anything else
+// routes to the multilingual model rather than failing.
+//
+// Routing a directly-supported language to "multi" is not a graceful
+// degradation, it is a broken transcript: Mandarin audio that "zh" returns
+// verbatim at confidence 1.00 comes back from "multi" as
+// "你好、徐死意gue ю因ceder shi" at 0.25. Only add a case here after checking
+// the language against real audio — an untested code silently produces that
+// same soup.
+func nova3Language(locale string) string {
+	base := strings.ToLower(strings.TrimSpace(locale))
+	if idx := strings.Index(base, "-"); idx > 0 {
+		base = base[:idx]
+	}
+	switch base {
+	case "", "en":
+		return "en"
+	case "es", "zh":
+		return base
+	// Checked against real audio (clean and phone-quality) with the language
+	// fixed: 0.97-1.00 confidence, word-accurate. Multi mode hears none of
+	// the Indian ones or ko/ar/tr/pl, and is unsure of uk/cs/hu/sv/ro/fi/da/vi (0.0-0.83) -- it returns Hindi-looking text or soup.
+	// Malayalam is not offered by Nova-3.
+	case "hi", "ta", "te", "kn", "bn", "gu", "pa", "mr",
+		"fr", "de", "it", "pt", "nl", "ru", "ja", "ko", "ar", "tr", "pl",
+		"uk", "cs", "hu", "sv", "ro", "fi", "da", "vi":
+		return base
+	default:
+		return "multi"
+	}
+}
+
+// SendAudio sends raw linear16 PCM bytes to Deepgram.
+func (c *deepgramClient) SendAudio(data []byte) error {
+	_, err := c.ws.Write(data)
+	return err
+}
+
+// Close gracefully shuts down the Deepgram connection.
+func (c *deepgramClient) Close() {
+	if c.ws != nil {
+		c.ws.Finish()
+	}
+	c.cancel()
+	log.Println("[stt] closed")
+}

@@ -1,0 +1,443 @@
+package pipeline
+
+// Barge-in classification helpers: pure text predicates shared by the
+// inbound reader and the turn buffer. Deliberately free of Pipeline state
+// so they stay unit-testable.
+
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
+
+// ---------------------------------------------------------------------------
+// Normalization
+// ---------------------------------------------------------------------------
+
+// normalizedTranscriptText lowercases an utterance and reduces it to
+// space-separated words, keeping only letters, digits, and apostrophes.
+// Every predicate below operates on this form.
+func normalizedTranscriptText(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		switch {
+		// Marks too: Devanagari and other Indic scripts write vowels as
+		// combining marks, and dropping them splits every word apart.
+		case unicode.IsLetter(r), unicode.IsMark(r), unicode.IsDigit(r), r == '\'':
+			b.WriteRune(r)
+		default:
+			b.WriteByte(' ')
+		}
+	}
+	return normalizeNasal(strings.Join(strings.Fields(b.String()), " "))
+}
+
+// lastWord returns the final word of an utterance, lowercased and stripped of
+// surrounding punctuation, or "" if there is none. Shared by the
+// end-of-utterance predicates, which differ only in the vocabulary they
+// match that word against.
+func lastWord(s string) string {
+	const punct = ",.!?;:-—'\""
+	fields := strings.Fields(strings.ToLower(s))
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.Trim(fields[len(fields)-1], punct)
+}
+
+// ---------------------------------------------------------------------------
+// Barge-in predicates
+// ---------------------------------------------------------------------------
+
+// isBackchannelOnly reports whether every token of the (already normalized)
+// utterance is acknowledgement vocabulary — the combined-backchannel case.
+func isBackchannelOnly(tokens []string) bool {
+	if len(tokens) == 0 {
+		return false
+	}
+	for _, tok := range tokens {
+		if !backchannelWordTokens[tok] {
+			return false
+		}
+	}
+	return true
+}
+
+// isBackchannelTranscript reports whether a raw partial transcript is nothing
+// but acknowledgement words ("yeah okay", "mm-hm, right"). Empty text is not
+// a backchannel: it is no evidence either way.
+func isBackchannelTranscript(s string) bool {
+	return isBackchannelOnly(strings.Fields(normalizedTranscriptText(s)))
+}
+
+// isMeaningfulBargeInTranscript reports whether a partial transcript is worth
+// cutting the agent off for.
+func isMeaningfulBargeInTranscript(s string) bool {
+	tokens := strings.Fields(normalizedTranscriptText(s))
+	if len(tokens) == 0 {
+		return false
+	}
+
+	for _, tok := range tokens {
+		if bargeInCommandTokens[tok] {
+			return true
+		}
+	}
+
+	// Combined backchannels ("yep okay", "yeah yeah right") are still just
+	// the caller signalling they're listening — checked after commands so
+	// "okay stop" interrupts but "okay yeah" doesn't.
+	if isBackchannelOnly(tokens) {
+		return false
+	}
+
+	contentWords := 0
+	for _, tok := range tokens {
+		if len(tok) >= 3 && !bargeInWeakTokens[tok] {
+			contentWords++
+		}
+	}
+
+	// Require a content-bearing phrase ("change address", "billing question",
+	// "what time") unless this is an explicit interruption command. This
+	// keeps coughs, acknowledgements, and STT filler artifacts from cutting
+	// off the agent without tying barge-in to any specific business domain.
+	return contentWords >= 1 && len(tokens) >= 2
+}
+
+// isAcknowledgementOnly reports whether a whole turn is nothing but listening
+// noises — "okay", "yeah yeah", "mm-hm right", "got it".
+//
+// Deliberately a much lower bar than isMeaningfulBargeInTranscript. That
+// predicate decides whether to CUT THE AGENT OFF mid-word, so it can afford to
+// be conservative and demand two tokens plus a content word. This one decides
+// whether a turn is answered at all, so anything carrying meaning has to pass:
+// one-word questions ("why?"), corrections ("no"), and commands ("stop") are
+// all a single token and none of them are acknowledgement vocabulary.
+func isAcknowledgementOnly(s string) bool {
+	return isBackchannelOnly(strings.Fields(normalizedTranscriptText(s)))
+}
+
+// isStrongBargeInCommand returns true only for the small set of commands
+// that should always cut through a readback: "stop", "cancel", and
+// "hang up" (which also subsumes "stop talking" via the "stop" token).
+// Anything else — including the bargeInCommandTokens set used elsewhere
+// — is treated as a weak correction when the readback guard is engaged.
+func isStrongBargeInCommand(s string) bool {
+	tokens := strings.Fields(normalizedTranscriptText(s))
+	for i, tok := range tokens {
+		switch tok {
+		case "stop", "cancel":
+			return true
+		case "hang":
+			if i+1 < len(tokens) && tokens[i+1] == "up" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// End-of-utterance predicates (turn merging)
+// ---------------------------------------------------------------------------
+
+// endsTerminal reports whether the utterance ends with sentence-terminal
+// punctuation — the strongest available signal that the speaker finished a
+// complete thought. Used to shrink the merge window for the common case.
+// Trailing quotes/brackets after the terminal mark are tolerated.
+func endsTerminal(s string) bool {
+	trimmed := strings.TrimRight(strings.TrimSpace(s), "'\")]}」』")
+	if trimmed == "" {
+		return false
+	}
+	r, _ := utf8.DecodeLastRuneInString(trimmed)
+	switch r {
+	case '.', '!', '?', '。', '！', '？', '।', '॥':
+		return true
+	}
+	return false
+}
+
+// endsIncomplete reports whether the utterance trails off mid-thought, e.g. on
+// a conjunction, article, or filler word, or on a comma. Live, "Mi número de
+// pedido es" and "明日の予約ですが、" were answered before the caller went on.
+func endsIncomplete(s string) bool {
+	t := strings.TrimSpace(s)
+	if strings.HasSuffix(t, ",") || strings.HasSuffix(t, "、") || strings.HasSuffix(t, "，") {
+		return true
+	}
+	if incompleteTailWords[lastWord(s)] {
+		return true
+	}
+	t = strings.TrimRight(t, ".。 ")
+	for _, suffix := range incompleteTailSuffixes {
+		if strings.HasSuffix(t, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// endsDictation reports whether the pending turn text looks like an
+// in-progress spelled/numeric dictation: it ends on a separator word, a
+// lone letter ("…n z y"), or a digit run ("…0 4 1 2"). Callers pause far
+// longer between spelled segments than between words, and with 600ms
+// endpointing those pauses otherwise fragment the dictation into multiple
+// turns that garble email/phone extraction. Used ONLY for the turn-merge
+// window — deliberately NOT part of endsIncomplete, which also drives the
+// LLM's "caller trailed off" note (a complete spelled email legitimately
+// ends on a letter).
+func endsDictation(s string) bool {
+	last := lastWord(s)
+	if last == "" {
+		return false
+	}
+	if dictationTailWords[last] {
+		return true
+	}
+	if len(last) == 1 && last[0] >= 'a' && last[0] <= 'z' {
+		return true
+	}
+	for _, r := range last {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// Vocabularies
+// ---------------------------------------------------------------------------
+
+// readbackPhraseMarkers are normalized word sequences that signal the
+// agent's current utterance is a readback / explicit confirmation
+// prompt (the moments when "yeah actually..." style soft corrections
+// destroy context if allowed to barge in). The list is intentionally
+// small and tied to wording the form-readback templates actually emit.
+// Matched on word boundaries against the normalized agent text — a raw
+// substring match would also fire on words that merely CONTAIN a marker.
+var readbackPhraseMarkers = []string{
+	"is that right",
+	"is that correct",
+	"let me read that back",
+	"just to confirm",
+	"could you spell",
+}
+
+// backchannelWordTokens is the per-word acknowledgement vocabulary. A turn is
+// rejected as a backchannel only when EVERY token is in this set, so a caller
+// stacking acknowledgement words ("yep okay", "yeah yeah, right") is still
+// treated as listening rather than interrupting. Includes common STT spelling
+// variants ("mmhmm", "yup", "gotcha") so transcription drift doesn't punch
+// through. Because rejection requires a full match, listing common words like
+// "it"/"i" here is safe — any real content word breaks it.
+var backchannelWordTokens = map[string]bool{
+	"mm": true, "mhm": true, "mmhmm": true, "mhmm": true, "hmm": true, "hm": true,
+	"uh": true, "huh": true, "uhhuh": true, "um": true, "umm": true,
+	"yep": true, "yup": true, "yeah": true, "yea": true, "yes": true, "ya": true,
+	"okay": true, "ok": true, "kay": true, "right": true, "sure": true,
+	"alright": true, "cool": true, "nice": true, "wow": true, "oh": true,
+	"ah": true, "aha": true, "gotcha": true, "got": true, "it": true,
+	"i": true, "see": true, "true": true, "totally": true, "exactly": true,
+	"thats": true, "that's": true,
+
+	// The same "I'm listening" words in the languages callers most often
+	// switch to. Rejection still needs EVERY token to be in this set, so
+	// short function words ("de" in "de acuerdo", "va" in "va bene") can't
+	// swallow a real sentence.
+	// Spanish
+	"sí": true, "si": true, "vale": true, "claro": true, "ajá": true, "aja": true,
+	"bueno": true, "entiendo": true, "exacto": true, "perfecto": true, "de": true, "acuerdo": true,
+	// French
+	"oui": true, "ouais": true, "d'accord": true, "daccord": true, "voilà": true, "voila": true,
+	"bien": true, "entendu": true, "exactement": true, "parfait": true, "hum": true,
+	// Italian
+	"sì": true, "certo": true, "va": true, "bene": true, "esatto": true, "perfetto": true, "capito": true,
+	// Portuguese
+	"sim": true, "tá": true, "ta": true, "beleza": true, "entendi": true, "exato": true, "perfeito": true, "uhum": true,
+	// German
+	"ja": true, "genau": true, "gut": true, "richtig": true, "verstehe": true, "klar": true, "stimmt": true,
+	// Hindi, as speech-to-text writes it in Latin script
+	"haan": true, "han": true, "ha": true, "accha": true, "acha": true, "theek": true, "thik": true, "hai": true, "ji": true,
+	"haanji": true, "achha": true, "sahi": true,
+}
+
+// Native-script backchannels for every language Saylo hears. Speech-to-text
+// writes Indian languages in their own scripts (Deepgram: "हां", not "haan"),
+// so the Latin list above never matched them: live, "हाँ", "अच्छा" and
+// "हाँ जी" each stopped the agent and were answered as turns. Nasal marks
+// are normalized first (candrabindu → anusvara), so "हाँ" and "हां" are one
+// word. As above, a turn is a backchannel only if EVERY token is listed.
+func init() {
+	for _, w := range strings.Fields(`
+		हां जी अच्छा अच्छी ठीक है हम्म हम्म्म हूं ओके सही बिल्कुल वाह अरे हांजी
+		हो होय बरं बरोबर आहे
+		হ্যাং হ্যা হুম আচ্ছা ঠিক আছে জি
+		ஆமா ஆம் ஆமாம் சரி சரிங்க ம்ம் ஓகே
+		అవును సరే ఓకే హా ఆ మ్మ్ అలాగే
+		ಹೌದು ಸರಿ ಹೂಂ ಓಕೆ ಹಾ ಆಯ್ತು
+		അതെ ശരി ഓക്കെ ഉം ആ
+		હા હાં બરાબર સારું ઠીક છે જી
+		ਹਾਂ ਜੀ ਅੱਛਾ ਠੀਕ ਹੈ ਹਾਂਜੀ
+		ହଂ ଠିକ ଅଛି ହଉ
+		はい うん ええ そうですね なるほど そうそう はいはい うんうん へえ
+		嗯 对 好 是的 好的 对对 嗯嗯 明白
+		네 응 예 그렇군요 맞아요
+		نعم اه ايوه أيوه طيب تمام صح
+		evet tamam hı anladım peki
+		да ага угу ну понятно хорошо ясно
+		так зрозуміло добре
+		tak aha dobrze jasne mhm rozumiem
+		oké precies klopt prima
+		ano jo jasně dobře
+		igen jó értem persze
+		precis okej jaha
+		da bine sigur
+		joo kyllä niin okei aivan
+		jo præcis netop
+		vâng dạ ừ đúng rồi được
+	`) {
+		backchannelWordTokens[normalizeNasal(w)] = true
+	}
+}
+
+// candrabindu → anusvara per Indian script: speech-to-text writes "haan" both
+// ways (हाँ / हां), and the backchannel list has one spelling.
+var nasalFold = strings.NewReplacer(
+	"\u0901", "\u0902", // Devanagari
+	"\u0981", "\u0982", // Bengali
+	"\u0A01", "\u0A02", // Gurmukhi
+	"\u0A81", "\u0A82", // Gujarati
+	"\u0B01", "\u0B02", // Odia
+	"\u0C01", "\u0C02", // Telugu
+	"\u0C81", "\u0C82", // Kannada
+)
+
+func normalizeNasal(s string) string { return nasalFold.Replace(s) }
+
+// bargeInCommandTokens are words that interrupt the agent on their own, no
+// matter what else the utterance contains.
+var bargeInCommandTokens = map[string]bool{
+	"stop": true, "wait": true, "pause": true, "cancel": true,
+	"actually": true, "no": true, "hang": true, "hold": true,
+	"repeat": true, "transfer": true, "operator": true, "human": true,
+	"help": true,
+	// "Wait" / "stop" / "no" in Spanish, French, Italian, Portuguese, German
+	// and (Latin-script) Hindi. Only words that mean nothing else: Spanish
+	// "para" (stop, but also "for") would interrupt half of all sentences.
+	"espera": true, "espere": true, "alto": true,
+	"attendez": true, "attends": true, "arrêtez": true, "arrête": true, "non": true,
+	"aspetta": true, "aspetti": true, "basta": true,
+	"pare": true, "não": true, "nao": true,
+	"warte": true, "warten": true, "stopp": true, "halt": true, "nein": true,
+	"ruko": true, "rukiye": true, "nahi": true, "nahin": true,
+	// "Sorry, …" / "Excuse me, …" open an interruption: live, "sorry to cut
+	// in" waited for "cut in" before the agent stopped (1.3 s).
+	"sorry": true, "excuse": true,
+}
+
+// Native-script "wait / stop / no" for the other languages Saylo hears.
+// As above, only words that don't mean something else.
+func init() {
+	for _, w := range strings.Fields(`
+		रुको रुकिए रुकें ठहरिए ठहरो नहीं नही थांबा नाही
+		থামুন থামো না দাঁড়ান
+		இருங்க நில்லுங்க வேண்டாம் இல்லை
+		ఆగండి ఆగు వద్దు కాదు
+		ನಿಲ್ಲಿ ತಡೆಯಿರಿ ಬೇಡ ಇಲ್ಲ
+		നിർത്തൂ നിൽക്കൂ വേണ്ട ഇല്ല
+		રોકો ઊભા ના નહીં
+		ਰੁਕੋ ਨਹੀਂ
+		ରୁହନ୍ତୁ ନାହିଁ
+		待って ちょっと いいえ 等等 等一下 停 不是 잠깐 잠깐만요 아니요
+		подождите стоп нет зачекайте ні czekaj stój nie wacht nee počkejte ne
+		várjon nem vänta nej stai nu odota ei vent dừng khoan không
+	`) {
+		bargeInCommandTokens[normalizeNasal(w)] = true
+	}
+}
+
+// bargeInWeakTokens carry no content on their own, so they don't count toward
+// the content-word threshold that lets a phrase interrupt the agent.
+var bargeInWeakTokens = map[string]bool{
+	"i": true, "im": true, "i'm": true, "me": true, "my": true,
+	"you": true, "your": true, "we": true, "it": true, "this": true,
+	"that": true, "the": true, "a": true, "an": true,
+	"and": true, "or": true, "but": true, "so": true, "to": true,
+	"of": true, "for": true, "with": true, "on": true, "in": true,
+	"at": true, "from": true, "about": true,
+	"is": true, "are": true, "was": true, "were": true, "be": true,
+	"can": true, "could": true, "would": true, "should": true,
+	"will": true, "do": true, "does": true, "did": true,
+	"need": true, "want": true,
+	"um": true, "uh": true, "uhh": true, "umm": true, "hmm": true,
+	"okay": true, "ok": true, "yeah": true, "yes": true, "yep": true,
+	"right": true, "sure": true,
+}
+
+// incompleteTailWords, as the last word of an utterance, strongly suggest the
+// speaker was cut off by their own pause rather than finished.
+var incompleteTailWords = map[string]bool{
+	"um": true, "uh": true, "er": true, "hmm": true, "like": true,
+	"and": true, "or": true, "but": true, "so": true, "because": true,
+	"if": true, "when": true, "then": true, "while": true, "as": true,
+	"that": true, "which": true, "who": true, "where": true, "why": true, "how": true,
+	"the": true, "a": true, "an": true, "my": true, "your": true, "this": true,
+	"to": true, "of": true, "for": true, "with": true, "at": true, "on": true, "in": true,
+	"by": true, "from": true, "about": true, "into": true, "onto": true, "over": true, "under": true,
+	"is": true, "are": true, "was": true, "were": true, "be": true, "been": true, "being": true,
+	"am": true, "do": true, "does": true, "did": true, "have": true, "has": true, "had": true,
+	"will": true, "would": true, "can": true, "could": true, "shall": true, "should": true,
+	"may": true, "might": true, "must": true,
+	"i": true, "you": true, "he": true, "she": true, "we": true, "they": true, "it": true,
+
+	// Other languages: only words a finished sentence can't end on.
+	// Spanish
+	"y": true, "o": true, "pero": true, "porque": true, "que": true, "de": true, "del": true,
+	"al": true, "en": true, "con": true, "por": true, "para": true, "el": true, "la": true,
+	"los": true, "las": true, "un": true, "una": true, "mi": true, "mis": true, "tu": true,
+	"su": true, "es": true, "si": true, "cuando": true,
+	// French
+	"et": true, "ou": true, "mais": true, "parce": true, "qui": true, "du": true, "des": true,
+	"à": true, "au": true, "aux": true, "dans": true, "pour": true, "avec": true, "sur": true,
+	"par": true, "le": true, "les": true, "une": true, "mon": true, "ma": true, "mes": true,
+	"est": true, "sont": true, "je": true, "nous": true, "vous": true, "quand": true,
+	// German (not separable particles like "auf", "mit": "Ich komme mit";
+	// "an" is English's article, so an unpunctuated "Ich rufe Sie an" waits
+	// the longer window -- a delay, not a wrong answer)
+	"und": true, "oder": true, "aber": true, "weil": true, "dass": true, "wenn": true,
+	"der": true, "das": true, "dem": true, "den": true, "eine": true, "einen": true,
+	"einem": true, "mein": true, "meine": true, "ist": true, "sind": true, "ich": true,
+	"für": true, "von": true,
+	// Italian and Portuguese
+	"e": true, "perché": true, "che": true, "di": true, "della": true,
+	"il": true, "lo": true, "gli": true, "per": true, "è": true, "sono": true,
+	// (not "no", "da": "No", "Ich bin da" end sentences)
+	"mas": true, "dos": true, "ao": true, "em": true,
+	"na": true, "com": true, "os": true, "uma": true,
+	"meu": true, "minha": true, "é": true, "são": true,
+	// Hindi
+	"और": true, "या": true, "लेकिन": true, "कि": true, "क्योंकि": true, "का": true,
+	"की": true, "के": true, "को": true, "से": true, "में": true, "ने": true, "मेरा": true,
+	"मेरी": true, "मेरे": true, "अगर": true, "जब": true,
+}
+
+// incompleteTailSuffixes end a mid-sentence clause in languages written
+// without spaces: Japanese "…ですが" ("…but"), "…ので", Korean "…는데",
+// "…지만", "…고". Not Japanese "て": "待って" is a whole sentence.
+var incompleteTailSuffixes = []string{
+	"が", "けど", "けれど", "ので", "を", "に", "は",
+	"는데", "지만", "니까", "하고", "이고",
+}
+
+// dictationTailWords are tokens that signal the caller is mid-dictation of
+// an email, phone number, or spelled word — separators and provider names
+// spoken between segments.
+var dictationTailWords = map[string]bool{
+	"dot": true, "dash": true, "hyphen": true, "underscore": true,
+	"plus": true, "slash": true, "period": true, "point": true,
+	"gmail": true, "hotmail": true, "outlook": true, "yahoo": true,
+	"icloud": true, "mail": true,
+}
